@@ -1,5 +1,7 @@
 # Tower Agent Framework — Phase 1 Implementation Plan
 
+> **Status (2026-06-15):** Core runtime functional but significant deviations from this plan. See [[2026-06-15-phase-1-status]] for detailed actual-vs-planned comparison. Key diffs: DeepSeek instead of Anthropic, Postgres instead of SQLite, tool-calling instead of text-based plans, 0 tests written, tracing+MCP+skill-loader descoped.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the core agent runtime — LangGraph orchestration with plan→act→observe→refine→respond loop, MCP client manager, built-in tools, tracing, session memory, and CLI.
