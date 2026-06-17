@@ -13,6 +13,7 @@
 5. [File Structure — Independent Package Layout](#5-file-structure--independent-package-layout)
 6. [Execution Model & State Consistency](#6-execution-model--state-consistency)
 7. [Execution Semantics & Fault Tolerance](#7-execution-semantics--fault-tolerance)
+8. [Memory OS — Learning Execution System](#8-memory-os--learning-execution-system)
 
 ---
 
@@ -1084,6 +1085,512 @@ class RunMode(str, Enum):
 | Crash recovery | LangGraph checkpoint before every handoff |
 | Agent death detection | Heartbeat + MonitorAgent fallback |
 | Full replayability | `event_log` append-only + `RunMode.REPLAY` |
+
+---
+
+## 8. Memory OS — Learning Execution System
+
+### 8.1 Overview
+
+The Memory OS upgrades Tower from a multi-agent execution system into a **self-improving scientific computation OS**. Its core insight: execution traces are not just for debugging — they are the raw material from which the system learns.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                  MEMORY OPERATING SYSTEM                   │
+├────────────────────────────────────────────────────────────┤
+│  1. Execution Memory   — LangGraph checkpoint (per-run)    │
+│  2. Working Memory     — RunContextBuffer (intra-run)      │
+│  3. Long-term Memory   — Semantic Memory Store (cross-run) │
+│  4. Memory Compiler    — runs → compressed knowledge       │
+│  5. Memory Retriever   — task → relevant past experience   │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 Architecture in Context
+
+```
+                     ┌──────────────────────────┐
+                     │   SUPERVISOR (planner)    │
+                     │   memory-conditioned      │
+                     └────────────┬─────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+   ┌────▼────┐             ┌──────▼──────┐           ┌──────▼──────┐
+   │ Memory  │             │  Execution  │           │  Artifact   │
+   │  OS     │             │  Engine     │           │  System     │
+   │         │             │ (LangGraph) │           │             │
+   │ compile │◄────────────│  run_state  │──────────►│ registry    │
+   │ retrieve│────────────►│  working_mem│           │ files       │
+   └────┬────┘             └─────────────┘           └─────────────┘
+        │
+        │ pgvector (semantic search)
+   ┌────▼──────────┐
+   │ Long-Term     │  AsyncPostgresStore
+   │ Memory Store  │  embedding-based retrieval
+   └───────────────┘
+```
+
+### 8.3 Layer 1: Execution Memory
+
+This is the existing `AsyncPostgresSaver` — LangGraph's native checkpoint mechanism. It persists the exact graph state at every handoff point, enabling crash recovery and replay.
+
+**What it stores**: Full `RunState` (agent task statuses, artifact registry, job registry, event log, supervisor decisions).
+
+**Rules**:
+- NOT queryable by semantic search. This is raw execution state.
+- NOT compressed. Full fidelity for exact replay.
+- Automatically managed by LangGraph. No agent code touches it directly.
+
+### 8.4 Layer 2: Working Memory (RunContextBuffer)
+
+**New module**: `src/tower/memory/working.py`
+
+This is an intra-run buffer that holds information that is NOT part of persistent state but needs to flow between agents within a single run.
+
+```python
+class RunContext(BaseModel):
+    """Intra-run working memory — lives only for the duration of one Run.
+
+    NOT persisted. Rebuildable from ExecutionMemory if needed.
+    """
+    trace_id: str
+    run_id: str
+
+    # Supervisor reasoning chain
+    supervisor_plan: list[str] = Field(default_factory=list)
+    supervisor_rationale: str = ""
+
+    # Intermediate artifacts that don't need full ArtifactRecord tracking
+    scratchpad: dict[str, Any] = Field(default_factory=dict)
+    # {"scf_converged": True, "active_orbital_indices": [3,4,5,6]}
+
+    # Tool call cache (avoid re-calling idempotent tools)
+    tool_cache: dict[str, Any] = Field(default_factory=dict)
+    # {"queue_status_node03": {...}, "template_gaussian_opt": "..."}
+
+    # Agent-to-agent handoff notes
+    handoff_notes: dict[str, str] = Field(default_factory=dict)
+    # {"gaussian→pyscf": "use orbitals 3-6 as active space"}
+```
+
+**Lifecycle**:
+- Created when Run starts.
+- Agents read/write through `RunContextBuffer`.
+- Discarded when Run completes.
+- Rebuildable from ExecutionMemory + ArtifactRegistry if crash recovery is needed.
+
+**Key constraint**: Working memory is NOT authoritative. The single source of truth is `RunStateStore`. Working memory is a convenience buffer.
+
+### 8.5 Layer 3: Long-Term Memory (Semantic Memory Store)
+
+**Upgraded from**: existing `LongTermMemory` in `src/tower/memory/long_term.py`.
+
+The long-term store is upgraded from a simple key-value fact store to a **semantic memory store** with typed memory records and embedding-based retrieval.
+
+```python
+class MemoryType(str, Enum):
+    TASK_PATTERN = "task_pattern"          # "Gaussian opt → PySCF CASSCF → Orca NEVPT2"
+    CHEMICAL_INSIGHT = "chemical_insight"  # "N2 bond length ~1.1 Å"
+    FAILURE_PATTERN = "failure_pattern"    # "SCF fails when basis too small, maxiter < 100"
+    TOOL_HEURISTIC = "tool_heuristic"      # "HPC memory underestimates if nprocs > 32"
+    USER_PREFERENCE = "user_preference"    # "prefers B3LYP/def2SVP for organics"
+    SUCCESSFUL_PIPELINE = "successful_pipeline"  # full run that completed with verified results
+
+
+class MemoryRecord(BaseModel):
+    memory_id: str                         # unique, hash-derived
+    trace_id: str | None                   # source run (None for manually added)
+    content: str                           # human-readable knowledge
+    embedding: list[float] = Field(default_factory=list)  # pgvector embedding
+    memory_type: MemoryType
+    source_artifacts: list[str] = Field(default_factory=list)  # artifact_ids
+    confidence: float = 1.0                # 1.0 = verified by successful run
+    created_at: datetime = Field(default_factory=datetime.now)
+    last_accessed_at: datetime | None = None
+    access_count: int = 0
+```
+
+**Storage**: `AsyncPostgresStore` with `pgvector` extension for embedding similarity search.
+
+**Upgrade from current `LongTermMemory`**:
+- `get_all_facts()` → semantic search by embedding
+- `add_fact(fact, category)` → `add_record(MemoryRecord)` with auto-embedding
+- New: `search_by_type(MemoryType)` for filtering
+- New: `search_similar(content, k=5)` for embedding-based retrieval
+
+### 8.6 Layer 4: Memory Compiler
+
+**New module**: `src/tower/memory/compiler.py`
+
+The compiler transforms raw execution traces into structured knowledge. It runs AFTER a Run completes (triggered by Supervisor).
+
+```python
+class MemoryCompiler:
+    """Compress execution traces into structured MemoryRecords.
+
+    Input: RunState + ArtifactRegistry + MonitorEvents
+    Output: list[MemoryRecord]
+
+    Principles:
+    - Compression: raw logs → patterns
+    - Event-derived: compiler reads events, agents don't write memory directly
+    - De-duplication: similar memories are merged, not duplicated
+    """
+
+    def __init__(self, ltm: "LongTermMemory", llm=None):
+        self.ltm = ltm
+        self.llm = llm  # LLM for summarization (optional, falls back to heuristics)
+
+    async def compile_run(self, run_state: "RunState") -> list[MemoryRecord]:
+        """Compile one completed run into memory records."""
+        records = []
+
+        # 1. Extract task pattern (the workflow itself as a reusable template)
+        task_pattern = await self._extract_task_pattern(run_state)
+        if task_pattern:
+            records.append(task_pattern)
+
+        # 2. Extract failure patterns (what went wrong and how it was fixed)
+        failure_patterns = await self._extract_failure_patterns(run_state)
+        records.extend(failure_patterns)
+
+        # 3. Extract tool heuristics (parameter-performance relationships)
+        tool_heuristics = await self._extract_tool_heuristics(run_state)
+        records.extend(tool_heuristics)
+
+        # 4. Extract chemical insights (energies, convergence behavior)
+        chemical_insights = await self._extract_chemical_insights(run_state)
+        records.extend(chemical_insights)
+
+        # 5. Store all records (with dedup)
+        stored = []
+        for record in records:
+            memory_id = await self.ltm.add_record(record)
+            if memory_id:  # None if duplicate
+                stored.append(record)
+
+        return stored
+
+    async def _extract_task_pattern(self, run_state) -> MemoryRecord | None:
+        """Compress agent chain into a reusable pipeline template."""
+        agent_sequence = [
+            task_id.split("-")[0]  # "n2-nevpt2-gaussian-001" → "gaussian"
+            for task_id in run_state.agent_tasks
+        ]
+        # Only record if the run completed successfully
+        if run_state.status != TaskStatus.DONE:
+            return None
+
+        return MemoryRecord(
+            memory_id=hash_content(f"pipeline:{'→'.join(agent_sequence)}"),
+            trace_id=run_state.trace_id,
+            content=f"Pipeline: {' → '.join(agent_sequence)} for task: {run_state.task}",
+            memory_type=MemoryType.SUCCESSFUL_PIPELINE,
+            confidence=1.0,
+        )
+
+    async def _extract_failure_patterns(self, run_state) -> list[MemoryRecord]:
+        """Extract error→fix patterns from MonitorEvents."""
+        records = []
+        for event in run_state.event_log:
+            if event.event_type == "JOB_FAILED" and event.error_category:
+                # Check if it was later fixed (retried and succeeded)
+                was_fixed = self._was_error_fixed(event, run_state)
+                confidence = 0.9 if was_fixed else 0.5
+
+                records.append(MemoryRecord(
+                    memory_id=hash_content(f"failure:{event.error_category}:{event.agent}"),
+                    trace_id=run_state.trace_id,
+                    content=(
+                        f"Failure: {event.error_category} in {event.agent}. "
+                        f"Suggestion: {event.suggestion}. "
+                        f"{'Fixed by retry.' if was_fixed else 'Not resolved.'}"
+                    ),
+                    memory_type=MemoryType.FAILURE_PATTERN,
+                    confidence=confidence,
+                ))
+        return records
+
+    async def _extract_tool_heuristics(self, run_state) -> list[MemoryRecord]:
+        """Extract parameter-performance relationships from job records."""
+        records = []
+        for job_id, job in run_state.jobs.items():
+            if job.status == JobStatus.DONE:
+                records.append(MemoryRecord(
+                    memory_id=hash_content(f"heuristic:{job.agent}:{job_id}"),
+                    trace_id=run_state.trace_id,
+                    content=(
+                        f"Tool heuristic: {job.agent} job completed in "
+                        f"{job.wall_time_s}s on {job.node}. "
+                        f"Resources: {job.nprocs} cores, {job.mem_per_cpu_mb}MB/cpu."
+                    ),
+                    memory_type=MemoryType.TOOL_HEURISTIC,
+                    confidence=0.7,
+                ))
+        return records
+
+    async def _extract_chemical_insights(self, run_state) -> list[MemoryRecord]:
+        """Extract chemical results from AgentResults."""
+        # Parse AgentResult.data for energy values, convergence metrics
+        records = []
+        for task_id, status in run_state.agent_tasks.items():
+            if status == TaskStatus.DONE:
+                # The actual data extraction is domain-specific;
+                # the compiler reads AgentResult.data fields
+                records.append(MemoryRecord(
+                    memory_id=hash_content(f"insight:{task_id}"),
+                    trace_id=run_state.trace_id,
+                    content=f"Completed: {task_id}",
+                    memory_type=MemoryType.CHEMICAL_INSIGHT,
+                    confidence=0.8,
+                ))
+        return records
+
+    def _was_error_fixed(self, event, run_state) -> bool:
+        """Check if an error was later resolved by retry."""
+        # Look for a subsequent DONE status for the same agent
+        agent = event.agent
+        for task_id, status in run_state.agent_tasks.items():
+            if agent in task_id and status == TaskStatus.DONE:
+                return True
+        return False
+```
+
+**Key design principles**:
+
+1. **Execution ≠ Memory**: raw checkpoints are not knowledge. The compiler transforms them.
+2. **Memory must be compressed**: raw logs → patterns, not raw log storage.
+3. **Memory is event-derived**: agents don't write memory directly. Compiler reads events.
+4. **Memory is advisory**: Supervisor uses memory to inform decisions, not to dictate them.
+
+### 8.7 Layer 5: Memory Retriever
+
+**New module**: `src/tower/memory/retriever.py`
+
+The retriever finds relevant past experience for a new task. Supervisor calls it before planning.
+
+```python
+class MemoryRetriever:
+    """Retrieve relevant memories for a given task.
+
+    Uses pgvector embedding similarity + type filtering.
+    """
+
+    def __init__(self, ltm: "LongTermMemory"):
+        self.ltm = ltm
+
+    async def query(
+        self,
+        task: str,
+        memory_types: list[MemoryType] | None = None,
+        k: int = 5,
+    ) -> list[MemoryRecord]:
+        """Semantic search for memories relevant to the task.
+
+        Args:
+            task: Natural language task description.
+            memory_types: Filter by memory type. None = all types.
+            k: Max results to return.
+        """
+        records = await self.ltm.search_similar(
+            query=task,
+            memory_types=memory_types,
+            limit=k,
+        )
+        # Update access metadata
+        for r in records:
+            await self.ltm.mark_accessed(r.memory_id)
+        return records
+
+    async def get_failure_patterns(self, agent: str) -> list[MemoryRecord]:
+        """Get known failure patterns for a specific agent."""
+        return await self.ltm.search_by_type(
+            MemoryType.FAILURE_PATTERN,
+            filter_agent=agent,
+            limit=10,
+        )
+
+    async def get_successful_pipelines(self, task_hint: str) -> list[MemoryRecord]:
+        """Find pipelines that succeeded for similar tasks."""
+        return await self.ltm.search_similar(
+            query=task_hint,
+            memory_types=[MemoryType.SUCCESSFUL_PIPELINE],
+            limit=3,
+        )
+```
+
+### 8.8 Memory Lifecycle
+
+```
+RUN START
+   │
+   ├── Supervisor calls MemoryRetriever.query(task)
+   │   → relevant failure patterns, successful pipelines, user prefs
+   │   → injected into supervisor prompt as context
+   │
+   ▼
+┌──────────────────────────────────────────────────┐
+│               Execution Memory                    │
+│  LangGraph checkpoint (AsyncPostgresSaver)        │
+│  Full RunState at every handoff                   │
+│                                                   │
+│               Working Memory                      │
+│  RunContextBuffer (intra-run scratchpad)           │
+│  NOT persisted, rebuildable                       │
+└──────────────────────────────────────────────────┘
+   │
+   ▼
+RUN END (COMPLETED / FAILED / ABANDONED)
+   │
+   ├── MemoryCompiler.compile_run(run_state)
+   │   → task patterns, failure patterns, tool heuristics, chemical insights
+   │   → stored as MemoryRecords in Long-Term Memory
+   │
+   ▼
+┌──────────────────────────────────────────────────┐
+│            Long-Term Memory                       │
+│  AsyncPostgresStore + pgvector                     │
+│  Semantic search + type-filtered retrieval         │
+│                                                   │
+│  Records are:                                     │
+│  - Deduplicated (hash-based memory_id)            │
+│  - Confidence-scored (1.0 = verified)             │
+│  - Access-tracked (last_accessed_at, count)       │
+└──────────────────────────────────────────────────┘
+   │
+   ▼
+NEXT RUN: Retriever finds these records
+   → Supervisor makes memory-conditioned decisions
+```
+
+### 8.9 Supervisor: Memory-Conditioned Planning
+
+The supervisor prompt is enriched with retrieved memories:
+
+```python
+# agents/supervisor/supervisor.py
+
+async def plan_with_memory(task: str, retriever: MemoryRetriever) -> str:
+    """Build supervisor prompt with memory context."""
+    failures = await retriever.get_failure_patterns(agent="orca")
+    pipelines = await retriever.get_successful_pipelines(task)
+
+    memory_context = "## Relevant Past Experience\n"
+
+    if pipelines:
+        memory_context += "\n### Successful Pipelines\n"
+        for p in pipelines:
+            memory_context += f"- {p.content} (confidence: {p.confidence})\n"
+
+    if failures:
+        memory_context += "\n### Known Failure Patterns\n"
+        for f in failures:
+            memory_context += f"- {f.content}\n"
+
+    return memory_context
+```
+
+### 8.10 Long-Term Memory Upgrade
+
+The existing `LongTermMemory` class in `src/tower/memory/long_term.py` is upgraded with:
+
+```python
+# New methods added to LongTermMemory
+
+async def add_record(self, record: MemoryRecord) -> str | None:
+    """Add a MemoryRecord with auto-embedding. Returns memory_id or None if duplicate."""
+    # Check for duplicate
+    existing = await self.get(record.memory_id)
+    if existing:
+        # Update confidence: average with existing
+        old_conf = existing.get("confidence", 1.0)
+        record.confidence = (old_conf + record.confidence) / 2
+    # Generate embedding from content
+    if not record.embedding:
+        record.embedding = await self._embed(record.content)
+    await self.put(record.memory_id, record.model_dump())
+    return record.memory_id
+
+async def search_similar(
+    self, query: str, memory_types: list[str] | None = None,
+    limit: int = 5,
+) -> list[MemoryRecord]:
+    """Embedding-based semantic search."""
+    query_embedding = await self._embed(query)
+    # pgvector cosine similarity search
+    results = await self._store.asearch_similar(
+        self._namespace, query_embedding, limit=limit,
+    )
+    records = []
+    for item in results:
+        record = MemoryRecord(**item.value)
+        if memory_types is None or record.memory_type in memory_types:
+            records.append(record)
+    return records
+
+async def search_by_type(
+    self, memory_type: str, filter_agent: str | None = None,
+    limit: int = 10,
+) -> list[MemoryRecord]:
+    """Type-filtered search without embedding."""
+    items = await self._store.asearch(
+        self._namespace,
+        filter={"memory_type": memory_type},
+        limit=limit,
+    )
+    records = []
+    for item in items:
+        record = MemoryRecord(**item.value)
+        if filter_agent is None or filter_agent in record.content:
+            records.append(record)
+    return records
+
+async def _embed(self, text: str) -> list[float]:
+    """Generate embedding vector. Use OpenAI/text-embedding-3-small or local model."""
+    # Default: use existing LLM's embedding capability or an embedding MCP tool
+    ...
+```
+
+### 8.11 File Structure Updates
+
+```
+src/tower/memory/
+├── __init__.py          # [MODIFY] Export new modules
+├── pool.py              # [UNCHANGED] AsyncConnectionPool
+├── short_term.py        # [UNCHANGED] AsyncPostgresSaver (Execution Memory)
+├── long_term.py         # [UPGRADE] +embedding, +add_record, +search_similar
+├── working.py           # [NEW] RunContextBuffer (Working Memory)
+├── compiler.py          # [NEW] MemoryCompiler
+├── retriever.py         # [NEW] MemoryRetriever
+└── models.py            # [NEW] MemoryRecord, MemoryType, RunContext
+```
+
+### 8.12 MVP Scope for Memory OS
+
+For MVP (same priority as core agent implementation):
+
+| Component | MVP Scope | Later |
+|-----------|-----------|-------|
+| `models.py` | `MemoryRecord`, `MemoryType` Pydantic models | — |
+| `working.py` | `RunContext` with scratchpad + handoff_notes | tool_cache |
+| `long_term.py` upgrade | `add_record()`, `search_by_type()` (key-value filter) | `search_similar()` (pgvector embedding), `_embed()` |
+| `compiler.py` | `_extract_task_pattern()`, `_extract_failure_patterns()` | `_extract_tool_heuristics()`, LLM-based summarization |
+| `retriever.py` | `get_failure_patterns()`, `get_successful_pipelines()` | `query()` with embedding search |
+
+**MVP stores MemoryRecords as structured JSON in `AsyncPostgresStore` without embedding vectors. Semantic search is deferred to post-MVP. The compiler and retriever work with type-filtered key-value lookups.**
+
+### 8.13 Design Principles (Hard Constraints)
+
+| Principle | Meaning |
+|-----------|---------|
+| **Execution ≠ Memory** | Raw checkpoints are not knowledge. Compiler transforms them. |
+| **Memory must be compressed** | Raw logs → structured patterns. Never store raw logs as memory. |
+| **Memory is event-derived** | Compiler reads events. Agents NEVER write memory directly. |
+| **Memory is advisory** | Supervisor uses memory to INFORM decisions. Never follows blindly. |
+| **Deduplication by hash** | `memory_id = hash(content)`. Same insight stored once, confidence updated. |
+| **Confidence scoring** | Verified by successful run = 1.0. Heuristic = 0.5-0.7. Decays with age. |
+| **Memory ages** | `last_accessed_at` + `access_count` track relevance. Stale records can be pruned. |
 
 ---
 
