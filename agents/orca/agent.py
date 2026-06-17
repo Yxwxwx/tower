@@ -40,15 +40,20 @@ def generate_slurm(state: OrcaState) -> dict:
 
 def pre_done(state: OrcaState) -> dict:
     from contracts.agent_task import Artifact, TaskStatus
-    state.artifacts_out = [
-        Artifact(artifact_id=f"{state.task_id}-inp", type="inp",
-                 description="Orca input file", producer_agent="orca",
-                 producer_task_id=state.task_id),
-        Artifact(artifact_id=f"{state.task_id}-slurm", type="slurm",
-                 description="Rough Slurm template", producer_agent="orca",
-                 producer_task_id=state.task_id),
-    ]
-    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["pre_done"]}
+    return {
+        "status": TaskStatus.DONE,
+        "artifacts_out": [
+            Artifact(artifact_id=f"{state.task_id}-inp",
+                     path=f"jobs/{state.task_id}/orca.inp",
+                     type="inp", description="Orca input file",
+                     producer_agent="orca", producer_task_id=state.task_id),
+            Artifact(artifact_id=f"{state.task_id}-slurm",
+                     path=f"jobs/{state.task_id}/orca_rough.sh",
+                     type="slurm", description="Rough Slurm template",
+                     producer_agent="orca", producer_task_id=state.task_id),
+        ],
+        "node_history": state.node_history + ["pre_done"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -69,13 +74,18 @@ def parse_energy(state: OrcaState) -> dict:
 
 
 def register_artifacts(state: OrcaState) -> dict:
-    from contracts.agent_task import Artifact, TaskStatus
-    state.artifacts_out = [
-        Artifact(artifact_id=f"{state.task_id}-log", type="log",
-                 description="Orca NEVPT2 output log",
-                 producer_agent="orca", producer_task_id=state.task_id),
-    ]
-    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["register_artifacts"]}
+    from contracts.agent_task import Artifact, ArtifactStatus, TaskStatus
+    return {
+        "status": TaskStatus.DONE,
+        "artifacts_out": [
+            Artifact(artifact_id=f"{state.task_id}-log",
+                     path="", type="log",  # path resolved via ArtifactResolver
+                     description="Orca NEVPT2 output log",
+                     producer_agent="orca", producer_task_id=state.task_id,
+                     status=ArtifactStatus.READY),
+        ],
+        "node_history": state.node_history + ["register_artifacts"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════

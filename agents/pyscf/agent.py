@@ -40,15 +40,20 @@ def generate_slurm(state: PySCFState) -> dict:
 
 def pre_done(state: PySCFState) -> dict:
     from contracts.agent_task import Artifact, TaskStatus
-    state.artifacts_out = [
-        Artifact(artifact_id=f"{state.task_id}-orbitals", type="json",
-                 description="Active orbital selection", producer_agent="pyscf",
-                 producer_task_id=state.task_id),
-        Artifact(artifact_id=f"{state.task_id}-slurm", type="slurm",
-                 description="Rough Slurm template", producer_agent="pyscf",
-                 producer_task_id=state.task_id),
-    ]
-    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["pre_done"]}
+    return {
+        "status": TaskStatus.DONE,
+        "artifacts_out": [
+            Artifact(artifact_id=f"{state.task_id}-orbitals",
+                     path=f"jobs/{state.task_id}/active_orbitals.json",
+                     type="json", description="Active orbital selection",
+                     producer_agent="pyscf", producer_task_id=state.task_id),
+            Artifact(artifact_id=f"{state.task_id}-slurm",
+                     path=f"jobs/{state.task_id}/pyscf_rough.sh",
+                     type="slurm", description="Rough Slurm template",
+                     producer_agent="pyscf", producer_task_id=state.task_id),
+        ],
+        "node_history": state.node_history + ["pre_done"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -70,13 +75,18 @@ def parse_energy(state: PySCFState) -> dict:
 
 def register_artifacts(state: PySCFState) -> dict:
     """Register CASSCF output as artifacts for downstream (orca agent)."""
-    from contracts.agent_task import Artifact, TaskStatus
-    state.artifacts_out = [
-        Artifact(artifact_id=f"{state.task_id}-casscf", type="json",
-                 description="CASSCF energy + orbital info",
-                 producer_agent="pyscf", producer_task_id=state.task_id),
-    ]
-    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["register_artifacts"]}
+    from contracts.agent_task import Artifact, ArtifactStatus, TaskStatus
+    return {
+        "status": TaskStatus.DONE,
+        "artifacts_out": [
+            Artifact(artifact_id=f"{state.task_id}-casscf",
+                     path="", type="json",  # path resolved via ArtifactResolver
+                     description="CASSCF energy + orbital info",
+                     producer_agent="pyscf", producer_task_id=state.task_id,
+                     status=ArtifactStatus.READY),
+        ],
+        "node_history": state.node_history + ["register_artifacts"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
