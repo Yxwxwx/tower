@@ -92,6 +92,11 @@ def route_entry(state: PySCFState) -> Literal["pre", "post"]:
     return "pre"
 
 
+def _finalize(state: PySCFState) -> dict:
+    result = state.to_agent_result("pyscf")
+    return {"agent_result": result}
+
+
 # ═══════════════════════════════════════════════════════════════════
 
 def build_pyscf_graph() -> StateGraph:
@@ -104,17 +109,20 @@ def build_pyscf_graph() -> StateGraph:
     graph.add_node("read_output", read_output)
     graph.add_node("parse_energy", parse_energy)
     graph.add_node("register_artifacts", register_artifacts)
+    graph.add_node("finalize", _finalize)
 
     graph.add_conditional_edges(START, route_entry, {"pre": "read_fchk", "post": "read_output"})
 
     graph.add_edge("read_fchk", "select_orbitals")
     graph.add_edge("select_orbitals", "generate_slurm")
     graph.add_edge("generate_slurm", "pre_done")
-    graph.add_edge("pre_done", END)
+    graph.add_edge("pre_done", "finalize")
 
     graph.add_edge("read_output", "parse_energy")
     graph.add_edge("parse_energy", "register_artifacts")
-    graph.add_edge("register_artifacts", END)
+    graph.add_edge("register_artifacts", "finalize")
+
+    graph.add_edge("finalize", END)
 
     return graph
 

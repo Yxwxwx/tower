@@ -60,6 +60,19 @@ def route_entry(state: GaussianState) -> Literal["pre", "post"]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Finalize — converts internal state → AgentResult protocol
+# ═══════════════════════════════════════════════════════════════════
+
+def _finalize(state: GaussianState) -> dict:
+    """Convert internal state to AgentResult protocol.
+
+    This is the contract boundary. Every agent MUST return AgentResult.
+    """
+    result = state.to_agent_result("gaussian")
+    return {"agent_result": result}
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Graph
 # ═══════════════════════════════════════════════════════════════════
 
@@ -77,22 +90,27 @@ def build_gaussian_graph() -> StateGraph:
     graph.add_node("parse_energy", parse_energy)
     graph.add_node("register_artifacts", register_artifacts)
 
+    # Finalize — converts internal state to AgentResult protocol
+    graph.add_node("finalize", _finalize)
+
     # Conditional entry: pre or post?
     graph.add_conditional_edges(START, route_entry, {
         "pre": "query_knowledge",
         "post": "read_output",
     })
 
-    # Pre chain
+    # Pre chain → finalize
     graph.add_edge("query_knowledge", "generate_input")
     graph.add_edge("generate_input", "generate_slurm_template")
     graph.add_edge("generate_slurm_template", "pre_compute_done")
-    graph.add_edge("pre_compute_done", END)
+    graph.add_edge("pre_compute_done", "finalize")
 
-    # Post chain
+    # Post chain → finalize
     graph.add_edge("read_output", "parse_energy")
     graph.add_edge("parse_energy", "register_artifacts")
-    graph.add_edge("register_artifacts", END)
+    graph.add_edge("register_artifacts", "finalize")
+
+    graph.add_edge("finalize", END)
 
     return graph
 

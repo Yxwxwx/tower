@@ -89,6 +89,11 @@ def route_entry(state: OrcaState) -> Literal["pre", "post"]:
     return "pre"
 
 
+def _finalize(state: OrcaState) -> dict:
+    result = state.to_agent_result("orca")
+    return {"agent_result": result}
+
+
 def build_orca_graph() -> StateGraph:
     graph = StateGraph(OrcaState)
 
@@ -99,17 +104,20 @@ def build_orca_graph() -> StateGraph:
     graph.add_node("read_output", read_output)
     graph.add_node("parse_energy", parse_energy)
     graph.add_node("register_artifacts", register_artifacts)
+    graph.add_node("finalize", _finalize)
 
     graph.add_conditional_edges(START, route_entry, {"pre": "read_orbitals", "post": "read_output"})
 
     graph.add_edge("read_orbitals", "generate_input")
     graph.add_edge("generate_input", "generate_slurm")
     graph.add_edge("generate_slurm", "pre_done")
-    graph.add_edge("pre_done", END)
+    graph.add_edge("pre_done", "finalize")
 
     graph.add_edge("read_output", "parse_energy")
     graph.add_edge("parse_energy", "register_artifacts")
-    graph.add_edge("register_artifacts", END)
+    graph.add_edge("register_artifacts", "finalize")
+
+    graph.add_edge("finalize", END)
 
     return graph
 

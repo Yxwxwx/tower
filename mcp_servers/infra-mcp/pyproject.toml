@@ -1,0 +1,15 @@
+[project]
+name = "tower-infra-mcp"
+version = "0.1.0"
+description = "Tower infra MCP server — filesystem, template rendering, Slurm generation"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

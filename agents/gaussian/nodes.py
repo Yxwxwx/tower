@@ -4,7 +4,7 @@ LangGraph Pydantic state is immutable. Nodes return dict updates.
 scratchpad mutations must use {**state.scratchpad, key: value} pattern.
 """
 from contracts.gaussian_task import GaussianParams, GaussianResult
-from contracts.agent_task import Artifact, TaskStatus
+from contracts.agent_task import Artifact, ArtifactStatus, TaskStatus
 
 
 def _update_scratchpad(state, **kwargs) -> dict:
@@ -145,28 +145,33 @@ def parse_energy(state) -> dict:
 
 
 def register_artifacts(state) -> dict:
-    """Register .log/.fchk as artifacts for downstream agents.
+    """Surface HPC-produced log/fchk as artifacts for downstream agents.
 
-    In post-computation, log/fchk paths are resolved via ArtifactResolver
-    from the artifact_ids in state.scratchpad. The artifacts themselves
-    were created on disk by HPC execution.
+    The artifacts already exist in RunStateStore (registered by HPC/Monitor
+    when the job completed). We just surface their artifact_ids so the
+    supervisor can pass them to downstream agents via artifacts_in.
+
+    No new Artifact objects are created here — the files already exist.
     """
     artifacts = []
     log_id = state.scratchpad.get("log_artifact_id", "")
     fchk_id = state.scratchpad.get("fchk_artifact_id", "")
 
     if log_id:
-        # Path resolved from RunState.artifacts via ArtifactResolver
         artifacts.append(Artifact(
-            artifact_id=log_id, path=f"jobs/{state.task_id}/{state.task_id}.log",
-            type="log", description="Gaussian output log",
+            artifact_id=log_id,
+            path="",  # resolved at runtime via ArtifactResolver
+            type="log", description="Gaussian output log (HPC-produced)",
             producer_agent="gaussian", producer_task_id=state.task_id,
+            status=ArtifactStatus.READY,
         ))
     if fchk_id:
         artifacts.append(Artifact(
-            artifact_id=fchk_id, path=f"jobs/{state.task_id}/{state.task_id}.fchk",
-            type="fchk", description="Gaussian checkpoint",
+            artifact_id=fchk_id,
+            path="",  # resolved at runtime via ArtifactResolver
+            type="fchk", description="Gaussian checkpoint (HPC-produced)",
             producer_agent="gaussian", producer_task_id=state.task_id,
+            status=ArtifactStatus.READY,
         ))
 
     return {

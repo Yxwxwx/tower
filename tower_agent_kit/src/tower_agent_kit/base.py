@@ -15,6 +15,7 @@ from contracts.agent_task import (
     AgentName,
     AgentTask,
     AgentResult,
+    Artifact,
     RetryPolicy,
     TaskStatus,
 )
@@ -41,7 +42,8 @@ class BaseAgentState(BaseModel, Generic[TParams, TResult]):
     status: TaskStatus = TaskStatus.PENDING
     result_data: TResult | None = None
     errors: list[str] = Field(default_factory=list)
-    artifacts_out: list = Field(default_factory=list)
+    artifacts_out: list[Artifact] = Field(default_factory=list)
+    agent_result: Any = None  # set by finalize node: AgentResult[TResult]
 
     # ── Execution tracking ──
     node_history: list[str] = Field(default_factory=list)
