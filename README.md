@@ -1,83 +1,165 @@
 # Tower
 
-A general-purpose agent framework built on LangGraph + DeepSeek, with domain specialization via installable **Skill Packs**.
+**Supervisor-led modular multi-agent system for computational chemistry.**
+
+Built on LangGraph + MCP. A supervisor agent decomposes tasks, dispatches to specialized domain agents, collects results, and synthesizes output. All agents are independent — the supervisor alone decides execution order.
 
 ```
-Plan → Act → Observe → Refine → Respond
+User: "N2 NEVPT2"
+       ↓
+Supervisor: plan → gaussian → pyscf → orca
+       ↓            ↓         ↓        ↓
+    dispatch    .gjf+slurm  orbitals  NEVPT2 energy
+       ↓            ↓         ↓        ↓
+    collect    ✓ done     ✓ done    ✓ done
+       ↓
+Synthesize: E(NEVPT2) = -109.52 Ha
 ```
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 uv sync
-
-# Interactive chat
-uv run tower chat
-
-# Single task execution
-uv run tower run "list all Python files in src/"
-
-# List past sessions
-uv run tower sessions
+uv run tower agents          # list all registered agents
+uv run tower run "N2 NEVPT2" # execute a task
 ```
 
 ## Architecture
 
-Tower uses a LangGraph `StateGraph` with 5 nodes:
+Three-layer design:
 
-| Node | Role |
-|------|------|
-| `plan` | Decompose task into tool calls via LLM tool-calling |
-| `act` | Execute tools (bash, filesystem, web) with approval gates |
-| `observe` | Check success/failure; detect errors |
-| `refine` | LLM-based error recovery (retry with corrections) |
-| `respond` | Synthesize final answer from tool results |
+```
+┌─────────────────────────────────────────┐
+│           SUPERVISOR AGENT              │
+│  task → plan → dispatch → synthesize    │
+└────┬──────────┬──────────┬─────────────┘
+     │          │          │
+┌────▼──┐ ┌────▼──┐ ┌────▼──┐  ┌────▼──────────┐
+│gaussian│ │pyscf  │ │ orca │  │  hpc + monitor │
+│ agent  │ │agent  │ │agent │  │  (infra)       │
+└───┬────┘ └───┬───┘ └───┬──┘  └──────┬────────┘
+    │          │         │              │
+┌───▼──────────▼─────────▼──────────────▼──────┐
+│           SHARED MCP TOOL LAYER              │
+│  infra-mcp (filesystem, template, slurm)     │
+│  hpc-mcp  (queue-status, log-parser)         │
+└──────────────────────────────────────────────┘
+```
 
-### Memory
+### Agents (6 registered)
 
-- **Short-term** — LangGraph `PostgresSaver` for checkpoint/state persistence across sessions
-- **Long-term** — `PostgresStore` for cross-session user facts, auto-extracted via LLM
+| Agent | Type | Role |
+|-------|------|------|
+| `supervisor` | orchestrator | Task decomposition, dispatch, result synthesis |
+| `gaussian` | domain | HF/DFT input generation + output parsing |
+| `pyscf` | domain | Orbital selection + CASSCF |
+| `orca` | domain | NEVPT2 / coupled-cluster |
+| `hpc` | infrastructure | Slurm refinement, resource query, job submission |
+| `monitor` | infrastructure | Queue polling, log parsing, error feedback |
 
-### Tools (12 built-in)
+All agents are independent — no hard dependencies. The supervisor decides execution order and passes artifacts between agents.
 
-| Category | Tools |
-|----------|-------|
-| Shell | `bash` |
-| File I/O | `read_file`, `write_file`, `edit_file` |
-| Browse | `list_directory`, `glob_tool`, `grep` |
-| File Mgmt | `move_file`, `copy_file`, `delete_file` |
-| Web | `web_fetch`, `web_search` |
+### Agent Lifecycle (Pre/Post Computation)
 
-### Safety
+Each domain agent is called twice per run:
 
-All file and bash operations go through `tools/safety.py`:
-- System directory blacklist (`/etc`, `/usr`, `/System`, etc.)
-- Root privilege detection
-- Dangerous bash pattern blocking (`sudo`, `rm -rf /`, fork bombs, etc.)
-- Symlink traversal protection
-- Git repo boundary awareness
+1. **Pre-computation** — query DB → generate input files → rough slurm template → return artifacts
+2. HPC agent submits the job, Monitor watches it
+3. **Post-computation** — read output → parse results → register artifacts for downstream agents
+
+## Project Structure
+
+```
+tower/
+├── contracts/                   # frozen Pydantic schemas (pip package)
+│   └── src/contracts/           # AgentTask[T], AgentResult[T], domain Params/Result
+├── tower_agent_kit/             # agent scaffold (pip package)
+│   └── src/tower_agent_kit/     # BaseAgentState, AgentRegistration
+├── src/tower/                   # core infrastructure
+│   ├── state/                   #   RunStateStore, ArtifactRegistry, JobRegistry
+│   ├── memory/                  #   AsyncPostgresSaver/Store + Memory OS
+│   ├── mcp/                     #   MCP client (unified tool access)
+│   ├── tools/                   #   built-in tools (filesystem, bash, web)
+│   └── cli.py                   #   CLI entry point
+├── agents/                      # each agent is an independent module
+│   ├── supervisor/              #   plan → dispatch → synthesize
+│   ├── gaussian/                #   query DB → input → slurm | parse
+│   ├── pyscf/                   #   read fchk → orbitals → slurm | parse
+│   ├── orca/                    #   read orbitals → inp → slurm | parse
+│   ├── hpc/                     #   squeue → refine slurm → sbatch
+│   └── monitor/                 #   poll sacct → parse log → classify
+├── mcp_servers/                 # MCP tool servers
+│   ├── infra-mcp/               #   filesystem, template, slurm-gen
+│   └── hpc-mcp/                 #   queue-status, log-parser
+├── docs/superpowers/
+│   ├── specs/                   #   architecture design spec (8 sections)
+│   ├── contracts/               #   frozen workflow/agent/tool contracts
+│   └── archive/                 #   old single-agent docs
+└── tests/
+```
+
+## How to Add a New Agent
+
+1. Create `agents/<name>/` with `__init__.py` and `agent.py`
+2. Inherit from `BaseAgentState[YourParams, YourResult]`
+3. Implement nodes as pure functions `(state) → dict`
+4. Build a `StateGraph` with conditional routing
+5. Expose `register() → AgentRegistration`
+6. Add your `Params`/`Result` models to `contracts/src/contracts/`
+
+```python
+# agents/myagent/agent.py
+from tower_agent_kit.base import BaseAgentState, AgentRegistration
+
+class MyState(BaseAgentState[MyParams, MyResult]):
+    pass
+
+def my_node(state: MyState) -> dict:
+    return {"node_history": state.node_history + ["my_node"]}
+
+def _finalize(state: MyState) -> dict:
+    return {"agent_result": state.to_agent_result("myagent")}
+
+my_graph = (
+    StateGraph(MyState)
+    .add_node("my_node", my_node)
+    .add_node("finalize", _finalize)
+    .add_edge(START, "my_node")
+    .add_edge("my_node", "finalize")
+    .add_edge("finalize", END)
+    .compile()
+)
+
+def register() -> AgentRegistration:
+    return AgentRegistration(name="myagent", subgraph=my_graph, ...)
+```
+
+## Design Documents
+
+| Document | Description |
+|----------|-------------|
+| [Architecture Spec](docs/superpowers/specs/2026-06-17-tower-multi-agent-design.md) | 8-section full architecture (layers, contracts, supergraph, agent boundaries, state consistency, fault tolerance, Memory OS) |
+| [Workflow Contract](docs/superpowers/contracts/workflow_contract.md) | Run lifecycle, handoff semantics, artifact lifecycle, event flow, invariants |
+| [Agent Contract](docs/superpowers/contracts/agent_contract.md) | Per-agent frozen interfaces (input/output, nodes, tools, retry policy) |
+| [Tool Contract](docs/superpowers/contracts/tool_contract.md) | MCP tool schemas (9 tools, 2 servers, idempotency, error codes) |
+
+## Key Design Principles
+
+- **Contracts are frozen**. All agent communication uses `AgentTask[T]` → `AgentResult[T]`. No side channels.
+- **Artifacts are immutable**. Referenced by `artifact_id`, never by raw path. Retry → new artifact_id.
+- **State transitions are validated**. `validate_transition()` guards every write. Illegal transitions raise errors.
+- **Single writer per field**. Only the designated writer may modify each RunState field.
+- **Agents are independent**. No agent knows about other agents. The supervisor owns all orchestration.
+- **Memory is event-derived**. The Memory Compiler reads execution traces → produces knowledge. Agents never write memory directly.
 
 ## Development
 
 ```bash
-# Run tests (58 passing)
-uv run pytest tests/ -v
-
-# Python 3.14+ required
 uv sync
+uv run pytest tests/ -v
 ```
 
-## Status
-
-Phase 1 core runtime is **functional** — see [Phase 1 Status](docs/superpowers/2026-06-15-phase-1-status.md) for detailed actual-vs-planned comparison.
-
-Key deviations from the original design spec:
-- **DeepSeek** instead of Anthropic (requires `_sanitize_messages` workaround)
-- **PostgreSQL** instead of SQLite for memory
-- **Tool-calling** instead of text-based plan decomposition
-- **No MCP protocol** yet — tools are hardcoded in registry
-- **No tracing/skill-loader** yet — descoped for Phase 2
+Python 3.12+ required. 57 tests passing.
 
 ## License
 
