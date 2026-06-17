@@ -468,106 +468,234 @@ def _execute_tool(tc: dict, step_key: str, step_num: int, total: int) -> tuple[d
 def act_node(state: AgentState) -> dict:
     """执行 plan 中 current_step_index 指向的 tool call。
 
-    如果 retry_pending=True（refine 触发的重试），执行上一步但不回退 index，
-    避免 current_step_index 双向移动造成的混乱状态追踪。
+    如果工具返回 background_task，通过 interrupt() 暂停 graph，
+    等待 CLI 轮询完成后 resume 并继续。
+
+    retry_pending=True → 重试上一步（refine 触发），不回退 index。
     """
+    from langgraph.types import interrupt
+
     idx = state.get("current_step_index", 0)
     plan = state.get("plan", [])
     results = dict(state.get("tool_results", {}))
     retry_pending = state.get("retry_pending", False)
+    skill = state.get("_runtime", {}).get("skill")
+    history = list(state.get("tool_history", []))
 
-    # refine 触发的重试：执行上一步，不回退 current_step_index
+    # ── Refine 触发的重试：执行上一步，不回退 index ──
     if retry_pending:
         retry_step = idx - 1
         if retry_step < 0 or retry_step >= len(plan):
             return {"retry_pending": False, "node_history": state.get("node_history", []) + ["act"]}
 
-        tc = plan[retry_step]
+        tc = dict(plan[retry_step])  # copy to avoid mutating original
+
+        # Skill hook: pre-run validation
+        if skill and skill.act_hooks:
+            try:
+                tc["args"] = skill.act_hooks.pre_run(tc, state)
+            except Exception:
+                pass
+
         step_key = f"step_{retry_step}"
         result, tool_msg = _execute_tool(tc, step_key, retry_step + 1, len(plan))
         results[step_key] = result
 
+        history.append({
+            "step_key": step_key,
+            "tool": tc["name"],
+            "args": tc["args"],
+            "success": "error" not in result,
+        })
+
+        # Check for background task → interrupt
+        bg = result.get("background_task")
+        if bg:
+            final_result = interrupt({
+                "type": "background_task",
+                "task_id": bg.get("task_id", ""),
+                "status": bg.get("status", "running"),
+            })
+            results[step_key] = final_result
+            bg = None
+
         return {
             "tool_results": results,
             "messages": [tool_msg],
-            "current_step_index": idx,  # 不回退，保持正向移动
+            "tool_history": history,
+            "current_step_index": idx,
             "retry_pending": False,
+            "background_task": bg,
             "node_history": state.get("node_history", []) + ["act"],
         }
 
+    # ── 正常执行 ──
     if idx >= len(plan):
         return {"node_history": state.get("node_history", []) + ["act"]}
 
-    tc = plan[idx]
+    tc = dict(plan[idx])  # copy
+
+    # Skill hook: pre-run validation
+    if skill and skill.act_hooks:
+        try:
+            tc["args"] = skill.act_hooks.pre_run(tc, state)
+        except Exception:
+            pass
+
     step_key = f"step_{idx}"
     result, tool_msg = _execute_tool(tc, step_key, idx + 1, len(plan))
     results[step_key] = result
 
+    history.append({
+        "step_key": step_key,
+        "tool": tc["name"],
+        "args": tc["args"],
+        "success": "error" not in result,
+    })
+
+    # Skill hook: post-run enrichment
+    if skill and skill.act_hooks:
+        try:
+            result = skill.act_hooks.post_run(result, state)
+            results[step_key] = result
+        except Exception:
+            pass
+
+    # Check for background task → interrupt
+    bg = result.get("background_task")
+    if bg:
+        # Pause graph; CLI polls and resumes with Command(resume=result)
+        final_result = interrupt({
+            "type": "background_task",
+            "task_id": bg.get("task_id", ""),
+            "status": bg.get("status", "running"),
+        })
+        results[step_key] = final_result
+        bg = None
+
     return {
         "tool_results": results,
         "messages": [tool_msg],
+        "tool_history": history,
         "current_step_index": idx + 1,
+        "background_task": bg,
         "node_history": state.get("node_history", []) + ["act"],
     }
 
 
 def observe_node(state: AgentState) -> dict:
-    """检查上一步工具执行结果。"""
+    """检查上一步工具执行结果，按优先级检测错误：
+
+    1. 基础检查：result["error"] / bash returncode
+    2. Skill 错误检测器：逐个运行 get_error_detectors() 返回的检测器
+    3. 第一个命中 → error_info 和 refinement_needed
+
+    领域检测器只在 computation 步骤和失败步骤上运行，
+    io 步骤的成功执行不触发领域检测。
+    """
     idx = state.get("current_step_index", 0)
     plan = state.get("plan", [])
     results = state.get("tool_results", {})
     retry_count = state.get("retry_count", 0)
     max_retries = state.get("max_retries", 3)
+    skill = state.get("_runtime", {}).get("skill")
 
     last_key = f"step_{idx - 1}" if idx > 0 else None
     last_result = results.get(last_key, {}) if last_key else {}
     tool_name = plan[idx - 1]["name"] if idx > 0 and idx <= len(plan) else "?"
+    step_type = plan[idx - 1].get("step_type", "io") if idx > 0 and idx <= len(plan) else "io"
 
     print(f"\n[OBSERVE] step {idx}/{len(plan)} — {tool_name}")
 
-    # 判断失败：只看 "error" 字段，不做 returncode 的默认值假设
+    error_info = None
+    refinement_needed = False
+    observation = ""
+
+    # 1. 基础错误检查
     if last_result.get("error"):
         err = last_result["error"]
         observation = f"Tool '{tool_name}' failed: {err}"
         refinement_needed = retry_count < max_retries
         print(f"  FAILED ({'will retry' if refinement_needed else 'giving up'})")
     elif tool_name == "bash" and "returncode" in last_result and last_result["returncode"] != 0:
-        # bash 特有的 returncode 检查 —— 仅当 returncode 字段确实存在且非 0 时才判失败
         rc = last_result["returncode"]
         stderr = last_result.get("stderr", "")
-        observation = f"Tool 'bash' failed (rc={rc}): {stderr}"
+        observation = f"Tool 'bash' failed (rc={rc}): {stderr[:500]}"
         refinement_needed = retry_count < max_retries
         print(f"  FAILED ({'will retry' if refinement_needed else 'giving up'})")
     elif tool_name == "bash" and "returncode" in last_result and last_result["returncode"] == 0:
-        # bash 明确 returncode=0 —— 成功
         stderr = last_result.get("stderr", "")
+        stdout = last_result.get("stdout", "")
+        observation = f"Tool 'bash' succeeded"
+        refinement_needed = False
         if stderr:
             print(f"  OK (rc=0, stderr has {len(stderr)} chars)")
         else:
             print("  OK")
-        observation = f"Tool 'bash' succeeded"
-        refinement_needed = False
     else:
         observation = f"Tool '{tool_name}' succeeded"
         refinement_needed = False
         print("  OK")
 
+    # 2. Skill 错误检测器（仅 computation 步骤或已失败的步骤）
+    if skill and skill.observe_hooks:
+        try:
+            detectors = skill.observe_hooks.get_error_detectors()
+        except Exception:
+            detectors = []
+
+        if detectors:
+            # 收集所有可用的输出文本
+            stdout = last_result.get("stdout", "")
+            stderr = last_result.get("stderr", "")
+            exit_code = last_result.get("returncode", 0)
+
+            # 如果 result 已有 error 消息，追加到 stderr 供检测器分析
+            if last_result.get("error"):
+                stderr = stderr + "\n" + str(last_result["error"])
+
+            for detector in detectors:
+                try:
+                    detected = detector.detect(stdout, stderr, exit_code)
+                    if detected:
+                        error_info = {
+                            "error_type": detected.error_type,
+                            "message": detected.message,
+                            "suggestion": detected.suggestion,
+                            "can_auto_fix": detected.can_auto_fix,
+                        }
+                        observation = f"[{detected.error_type}] {detected.message}"
+                        refinement_needed = retry_count < max_retries
+                        print(f"  DETECTED: {detected.error_type} — {detected.message[:100]}")
+                        break
+                except Exception:
+                    continue
+
     return {
         "observation": observation,
+        "error_info": error_info,
         "refinement_needed": refinement_needed,
         "node_history": state.get("node_history", []) + ["observe"],
     }
 
 
 def refine_node(state: AgentState) -> dict:
-    """工具失败后，让 LLM 决定如何修正。"""
+    """工具失败后，按优先级尝试修正：
+
+    1. Skill fix strategy（按 error_type 查表，直接修正参数）
+    2. LLM-based correction（通用回退，让 LLM 建议新参数）
+    3. Give up（超过最大重试或无法自动修正）
+    """
     idx = state.get("current_step_index", 0)
-    plan = state.get("plan", [])
+    plan = list(state.get("plan", []))
     observation = state.get("observation", "")
+    error_info = state.get("error_info", {})
     retry_count = state.get("retry_count", 0)
     max_retries = state.get("max_retries", 3)
     history = list(state.get("messages", []))
+    skill = state.get("_runtime", {}).get("skill")
 
+    # 1. 超过最大重试 → 放弃
     if retry_count >= max_retries:
         print(f"\n[REFINE] max retries ({max_retries}) reached")
         return {
@@ -576,8 +704,6 @@ def refine_node(state: AgentState) -> dict:
             "observation": f"Max retries ({max_retries}) exceeded. Giving up on fixing this step.",
             "node_history": state.get("node_history", []) + ["refine"],
         }
-
-    print(f"\n[REFINE] retry {retry_count + 1}/{max_retries}")
 
     if idx < 1 or idx > len(plan):
         print(f"  bad idx={idx}, plan len={len(plan)}, skipping refine")
@@ -588,6 +714,42 @@ def refine_node(state: AgentState) -> dict:
             "node_history": state.get("node_history", []) + ["refine"],
         }
 
+    error_type = error_info.get("error_type", "") if error_info else ""
+
+    print(f"\n[REFINE] retry {retry_count + 1}/{max_retries}")
+
+    # 2. Skill fix strategy（优先）
+    if skill and skill.refine_hooks and error_type:
+        try:
+            strategies = skill.refine_hooks.get_fix_strategies()
+            strategy_fn = strategies.get(error_type)
+            if strategy_fn:
+                correction = strategy_fn(error_info, plan[idx - 1])
+                if correction and correction.action == "retry_with_params" and correction.new_params:
+                    plan[idx - 1]["args"] = correction.new_params
+                    print(f"  auto-fix [{error_type}]: new params = {correction.new_params}")
+                    return {
+                        "plan": plan,
+                        "retry_count": retry_count + 1,
+                        "refinement_needed": False,
+                        "retry_pending": True,
+                        "node_history": state.get("node_history", []) + ["refine"],
+                    }
+                elif correction and correction.action == "ask_user":
+                    print(f"  cannot auto-fix [{error_type}], asking user")
+                    return {
+                        "refinement_needed": False,
+                        "retry_count": max_retries,
+                        "observation": (
+                            f"Cannot auto-fix: {error_info.get('message', '')}. "
+                            f"{error_info.get('suggestion', '')}"
+                        ),
+                        "node_history": state.get("node_history", []) + ["refine"],
+                    }
+        except Exception as e:
+            print(f"  fix strategy error: {e}")
+
+    # 3. LLM-based correction（通用回退）
     failed_tc = plan[idx - 1]
 
     refine_prompt = HumanMessage(content=(
@@ -625,12 +787,12 @@ def refine_node(state: AgentState) -> dict:
             "id": new_tool_calls[0].get("id", ""),
         }
         new_plan[idx - 1] = new_tc
-        print(f"  corrected: {new_tc['name']}({json.dumps(new_tc['args'], ensure_ascii=False)})")
+        print(f"  LLM corrected: {new_tc['name']}({json.dumps(new_tc['args'], ensure_ascii=False)})")
 
         return {
             "plan": new_plan,
             "messages": [refine_prompt, response],
-            "current_step_index": idx,  # 不回退，通过 retry_pending 触发重试
+            "current_step_index": idx,
             "retry_count": retry_count + 1,
             "refinement_needed": False,
             "retry_pending": True,

@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from tower.state import AgentState
 from tower.graph.nodes import plan_node, act_node, observe_node, refine_node, respond_node
-from tower.graph.edges import route_after_plan, route_after_observe
+from tower.graph.edges import route_after_plan, route_after_observe, route_after_refine
 
 
 def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> StateGraph:
@@ -41,7 +41,11 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> StateGraph:
         },
     )
 
-    graph.add_edge("refine", "act")
+    graph.add_conditional_edges(
+        "refine",
+        route_after_refine,
+        {"act": "act", "respond": "respond"},
+    )
     graph.add_edge("respond", END)
 
     return graph.compile(checkpointer=checkpointer)

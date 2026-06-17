@@ -1,4 +1,5 @@
 """Tower CLI — Plan→Act→Observe→Refine→Respond agent。"""
+import asyncio
 import os
 import uuid
 import traceback
@@ -12,8 +13,9 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 from tower.runtime.orchestrator import build_graph
+from tower.runtime.skill_loader import SkillLoader
 from tower.graph.nodes import _get_llm
-from tower.memory import create_checkpointer, LongTermMemory
+from tower.memory import create_checkpointer, LongTermMemory, close_pool
 
 load_dotenv()
 console = Console()
@@ -36,14 +38,14 @@ def _is_casual_chat(text: str) -> bool:
     return False
 
 
-def extract_memories(task: str, response: str, llm, ltm: LongTermMemory):
+async def extract_memories(task: str, response: str, llm, ltm: LongTermMemory):
     """分析对话，提取关于用户的长期记忆事实。同时处理矛盾信息。"""
     if _is_casual_chat(task):
         return
 
     # 获取已有事实，帮助 LLM 识别矛盾
     try:
-        existing_facts = ltm.get_all_facts()
+        existing_facts = await ltm.get_all_facts()
         existing_text = "\n".join(f"- [{f.get('category', '')}] {f['fact']}" for f in existing_facts)
     except Exception:
         existing_text = "(无法获取已有记忆)"
@@ -79,14 +81,14 @@ def extract_memories(task: str, response: str, llm, ltm: LongTermMemory):
         if line.upper().startswith("REMOVE:"):
             old_fact = line[7:].strip()
             try:
-                ltm.remove_fact_by_text(old_fact)
+                await ltm.remove_fact_by_text(old_fact)
                 console.print(Text(f"  🗑️ forgot: {old_fact}", style="dim"))
             except Exception:
                 pass
             continue
 
         try:
-            ltm.add_fact(line, category="user_profile")
+            await ltm.add_fact(line, category="user_profile")
             memories.append(line)
         except Exception:
             pass
@@ -100,17 +102,25 @@ def extract_memories(task: str, response: str, llm, ltm: LongTermMemory):
 class TowerChat:
     """Tower 对话会话。"""
 
-    def __init__(self, thread_id: str | None = None, user_id: str = "default"):
+    def __init__(self, thread_id: str | None = None, user_id: str = "default",
+                 skill_path: str | None = None):
         import threading
         self.user_id = user_id
         self.thread_id = thread_id or f"session-{uuid.uuid4().hex[:8]}"
         self.config = {"configurable": {"thread_id": self.thread_id}}
 
-        # 短期记忆：PostgresSaver
-        self.checkpointer = create_checkpointer(DB_URI)
+        # Skill pack（领域知识注入）
+        self.skill = None
+        if skill_path:
+            self.skill = SkillLoader.load(skill_path)
+            if self.skill:
+                console.print(Text(f"  🧪 skill loaded: {self.skill.name}", style="dim"))
+
+        # 短期记忆：AsyncPostgresSaver
+        self.checkpointer = asyncio.run(create_checkpointer(DB_URI))
         self.graph = build_graph(checkpointer=self.checkpointer)
 
-        # 长期记忆：PostgresStore
+        # 长期记忆：AsyncPostgresStore
         self.ltm = LongTermMemory(DB_URI, user_id=self.user_id)
 
         # LLM（复用 nodes.py 中的单例，避免重复创建连接池）
@@ -125,6 +135,8 @@ class TowerChat:
         history = self._load_history()
         lines = [f"[bold]Tower[/] — Plan→Act→Observe→Refine→Respond",
                  f"Session: [dim]{self.thread_id}[/]"]
+        if self.skill:
+            lines.append(f"Skill: [cyan]{self.skill.name}[/]")
         if history:
             lines.append("")
             lines.append("[dim]── previous messages ──[/]")
@@ -161,9 +173,9 @@ class TowerChat:
 
     def run(self, user_input: str):
         """执行一轮对话。"""
-        # 注入长期记忆
+        # 注入长期记忆（async → asyncio.run 桥接）
         try:
-            facts = self.ltm.get_all_facts()
+            facts = asyncio.run(self.ltm.get_all_facts())
         except Exception:
             facts = []
 
@@ -175,13 +187,17 @@ class TowerChat:
         else:
             task = user_input
 
-        # 等待上一轮的后台记忆提取完成，避免与主 graph 共享同一个 LLM 实例
+        # 等待上一轮的后台记忆提取完成，避免与主 graph LLM 并发调用
         if self._mem_thread and self._mem_thread.is_alive():
             self._mem_thread.join(timeout=10)
 
+        # 注入 skill 到 _runtime
+        runtime = {}
+        if self.skill:
+            runtime["skill"] = self.skill
+
         try:
-            # 显式重置 per-task 状态，避免上一轮 checkpoint 的 pass_count/plan/tool_results
-            # 污染新一轮任务。messages（对话历史）通过 add_messages reducer 保留。
+            # 显式重置 per-task 状态
             input_data = {
                 "task": task,
                 "pass_count": 0,
@@ -190,19 +206,19 @@ class TowerChat:
                 "current_step_index": 0,
                 "task_complete": False,
                 "node_history": [],
+                "_runtime": runtime,
             }
-            # 循环处理 LangGraph interrupt（审批等）
+            # 循环处理 LangGraph interrupt（审批、后台任务等）
             while True:
                 result = self.graph.invoke(input_data, self.config)
-                # 检查是否有 interrupt 需要处理
                 interrupt_list = result.get("__interrupt__", [])
                 if not interrupt_list:
                     break  # 正常完成
-                # 取出第一个 interrupt
                 intr_obj = interrupt_list[0]
                 intr_value = intr_obj.value if hasattr(intr_obj, "value") else intr_obj
+
                 if isinstance(intr_value, dict) and intr_value.get("type") == "approval":
-                    # 显示审批面板
+                    # 审批中断
                     console.print()
                     console.print(Panel(
                         f"[bold]{intr_value['tool']}[/]\n[dim]{intr_value['args']}[/]",
@@ -213,6 +229,34 @@ class TowerChat:
                     answer = console.input("  [dim]\\[y/N]:[/] ").strip().lower()
                     approved = answer in ("y", "yes")
                     input_data = Command(resume=approved)
+
+                elif isinstance(intr_value, dict) and intr_value.get("type") == "background_task":
+                    # 后台任务中断 — 轮询等待完成
+                    task_id = intr_value.get("task_id", "unknown")
+                    console.print()
+                    console.print(Panel(
+                        f"Task ID: [bold cyan]{task_id}[/]\n"
+                        f"Status: [yellow]{intr_value.get('status', 'running')}[/]",
+                        title="[bold blue]⏳ Background Task[/]",
+                        border_style="blue",
+                    ))
+                    console.print("  [dim]Polling for completion...[/]")
+
+                    # 轮询任务状态（实际实现应查询 MCP/db）
+                    import time
+                    poll_interval = 2
+                    max_polls = 300  # 10 分钟超时
+                    for _ in range(max_polls):
+                        time.sleep(poll_interval)
+                        break  # TODO: 替换为实际任务状态查询
+
+                    # Resume graph with completed result
+                    input_data = Command(resume={
+                        "status": "completed",
+                        "output": "computation completed",
+                        "task_id": task_id,
+                    })
+
                 else:
                     raise RuntimeError(f"Unknown interrupt: {intr_value}")
         except KeyboardInterrupt:
@@ -241,8 +285,10 @@ class TowerChat:
         def _safe_extract():
             with self._mem_lock:
                 try:
-                    extract_memories(user_input, result["final_response"],
-                                     self.mem_llm, self.ltm)
+                    asyncio.run(extract_memories(
+                        user_input, result["final_response"],
+                        self.mem_llm, self.ltm,
+                    ))
                 except Exception:
                     pass  # 后台线程错误不影响主循环
         self._mem_thread = threading.Thread(target=_safe_extract, daemon=True)
@@ -259,14 +305,16 @@ def cli():
 
 @cli.command()
 @click.option("--session", "-s", default=None, help="恢复指定会话 ID")
-def chat(session):
+@click.option("--skill-path", "-k", default=None, help="Skill pack 路径（如 skills/dmrg）")
+def chat(session, skill_path):
     """启动交互式对话。"""
 
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
-    chat_session = TowerChat(thread_id=session, user_id=os.getenv("USER", "default"))
+    chat_session = TowerChat(thread_id=session, user_id=os.getenv("USER", "default"),
+                             skill_path=skill_path)
 
     if session:
         console.print(f"[green]Resumed session: {session}[/]")
@@ -373,10 +421,12 @@ def list_sessions():
 @cli.command()
 @click.argument("task")
 @click.option("--session", "-s", default=None, help="会话 ID")
-def run(task: str, session: str | None):
+@click.option("--skill-path", "-k", default=None, help="Skill pack 路径（如 skills/dmrg）")
+def run(task: str, session: str | None, skill_path: str | None):
     """执行单个任务。"""
 
-    chat_session = TowerChat(thread_id=session, user_id=os.getenv("USER", "default"))
+    chat_session = TowerChat(thread_id=session, user_id=os.getenv("USER", "default"),
+                             skill_path=skill_path)
     chat_session.run(task)
 
 

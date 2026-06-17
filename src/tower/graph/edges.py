@@ -20,12 +20,22 @@ def route_after_observe(state: AgentState) -> str:
     plan = state.get("plan", [])
 
     if idx >= len(plan):
-        # 当前 plan 的步骤全部执行完
         if plan:
-            # 有 plan → 回 plan 判断是否还需要更多工具
             return "plan"
         else:
-            # plan 为空（闲聊或单步任务）→ 直接 respond，省一次 LLM 调用
             return "respond"
 
     return "act"
+
+
+def route_after_refine(state: AgentState) -> str:
+    """refine 之后：如果可以自动修正且还有重试次数 → act，否则 → respond。"""
+    error = state.get("error_info", {}) or {}
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 3)
+
+    if error.get("can_auto_fix") and retry_count < max_retries:
+        return "act"
+    if state.get("retry_pending"):
+        return "act"
+    return "respond"
