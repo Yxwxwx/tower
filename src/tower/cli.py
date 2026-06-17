@@ -3,9 +3,16 @@
 Rendering stack: Click (CLI framework) + Rich (terminal rendering).
 """
 import asyncio
+import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
+
+# Ensure agents/ is importable (project root on sys.path)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import click
 from rich.console import Console
@@ -99,11 +106,10 @@ def _render_agent_list(registrations: list) -> Table:
         show_lines=False,
     )
     table.add_column("Agent", style="bold", width=14)
-    table.add_column("Type", width=12)
+    table.add_column("Type", width=14)
     table.add_column("Retries", justify="center", width=8)
     table.add_column("Timeout", justify="right", width=10)
-    table.add_column("Dependencies", width=20)
-    table.add_column("Description", width=46)
+    table.add_column("Description", width=66)
 
     for r in sorted(registrations, key=lambda x: (
         0 if x.name == "supervisor" else
@@ -117,7 +123,6 @@ def _render_agent_list(registrations: list) -> Table:
         else:
             agent_type = "[green]domain[/]"
 
-        deps = ", ".join(sorted(r.dependencies)) if r.dependencies else "[dim]none[/]"
         timeout = f"{r.timeout_s // 3600}h" if r.timeout_s >= 3600 else f"{r.timeout_s}s"
 
         table.add_row(
@@ -125,8 +130,7 @@ def _render_agent_list(registrations: list) -> Table:
             agent_type,
             str(r.retry_policy.max_retries),
             timeout,
-            deps,
-            r.description[:80],
+            r.description[:100],
         )
 
     return table
@@ -159,17 +163,16 @@ def _render_plan(plan: list[str]):
     """Render the supervisor's execution plan."""
     if not plan:
         return
-    steps = []
+    parts = []
     for i, agent in enumerate(plan):
         color = "cyan" if agent == "supervisor" else "green"
-        arrow = "  →  " if i > 0 else ""
-        steps.append(Text(f"{arrow}[{color}]{agent}[/]", style=color))
+        parts.append(Text(f"[{color}]{agent}[/]", style=color))
         if i < len(plan) - 1:
-            steps.append(Text(""))
+            parts.append(Text(" → ", style="dim"))
 
     console.print()
     console.print(
-        Panel(Text(" → ").join(steps) if steps else Text("no steps"),
+        Panel(Text.assemble(*parts),
               title="[bold]Plan[/]", border_style="green", padding=(1, 2)))
 
 
@@ -329,36 +332,16 @@ def agents():
     console.print(_render_agent_list(registrations))
     console.print()
 
-    # Dependency visualization
-    dep_table = Table(
-        title="Dependency Graph",
-        box=box.SIMPLE,
-        border_style="dim blue",
-    )
-    dep_table.add_column("Agent", style="bold")
-    dep_table.add_column("Depends On")
-    dep_table.add_column("Feeds Into")
-
-    dep_graph = {}
-    for r in registrations:
-        dep_graph[r.name] = r.dependencies
-
-    reverse_deps = {r.name: set() for r in registrations}
-    for r in registrations:
-        for dep in r.dependencies:
-            reverse_deps[dep].add(r.name)
-
-    for r in sorted(registrations, key=lambda x: x.name):
-        deps = ", ".join(sorted(r.dependencies)) if r.dependencies else "[dim]—[/]"
-        feeds = ", ".join(sorted(reverse_deps[r.name])) if reverse_deps[r.name] else "[dim]—[/]"
-        dep_table.add_row(
-            str(_agent_name_cell(r.name)),
-            deps,
-            feeds,
-        )
-
-    console.print(dep_table)
+    # Architecture note
     console.print()
+    console.print(Panel(
+        "[dim]All agents are independent. The [cyan]supervisor[/] alone decides "
+        "execution order and data flow. Agents have no knowledge of each other — "
+        "the supervisor passes artifacts between them via [bold]artifacts_in[/].[/]",
+        title="[bold]Architecture[/]",
+        border_style="dim blue",
+        padding=(1, 2),
+    ))
 
 
 def main():
