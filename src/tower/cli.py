@@ -288,23 +288,21 @@ def run(task: str, run_id: Optional[str]):
         from agents.hpc import register as hp_reg
         from agents.monitor import register as mo_reg
 
-        agents = {
-            r.name: r
-            for r in [
-                sv_reg(),
-                ga_reg(),
-                py_reg(),
-                or_reg(),
-                hp_reg(),
-                mo_reg(),
-            ]
-        }
+        registrations = [
+            sv_reg(), ga_reg(), py_reg(), or_reg(), hp_reg(), mo_reg(),
+        ]
+        agents = {r.name: r for r in registrations}
+
+        # Wire agent subgraphs into supervisor's dispatch node
+        from agents.supervisor.agent import set_agent_registry
+        subgraphs = {r.name: r.subgraph for r in registrations if r.name != "supervisor"}
+        set_agent_registry(subgraphs)
 
         # Show loaded agents
         agent_list = ", ".join(str(_agent_name_cell(n)) for n in agents)
         console.print(f"  [dim]agents:[/] {agent_list}")
 
-        # Invoke supervisor
+        # Invoke supervisor — it dispatches agents internally
         supervisor = agents["supervisor"]
         initial_state = {
             "task": task,
@@ -312,24 +310,22 @@ def run(task: str, run_id: Optional[str]):
             "trace_id": trace_id,
         }
 
-        with console.status("[bold green]supervisor planning...[/]", spinner="dots"):
+        with console.status("[bold green]supervisor orchestrating...[/]", spinner="dots"):
             result = supervisor.subgraph.invoke(initial_state)
 
         plan = result.get("plan", [])
         _render_plan(plan)
 
-        # Execute each agent in the plan (MVP: simulate with status)
-        for i, agent_name in enumerate(plan):
-            if agent_name not in agents or agent_name == "supervisor":
-                continue
-
-            step_label = f"[bold]{agent_name}[/] ({i + 1}/{len(plan)})"
-
-            with console.status(f"  {step_label} [dim]executing...[/]", spinner="dots"):
-                time.sleep(0.3)  # MVP: simulate execution
-                # In production: agents[agent_name].subgraph.invoke(state)
-
-            _render_agent_result(agent_name, "done")
+        # Show per-agent results from actual dispatch
+        agent_results = result.get("agent_results", {})
+        for agent_name in plan:
+            ar = agent_results.get(agent_name)
+            if ar is not None and hasattr(ar, "status"):
+                status = ar.status.value
+                data = ar.data if hasattr(ar, "data") else None
+                _render_agent_result(agent_name, status, data=data)
+            else:
+                _render_agent_result(agent_name, "pending")
 
         # Final result
         _render_final_result(result.get("final_response", ""), plan)
