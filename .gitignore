@@ -13,6 +13,9 @@ wheels/
 # Tower data
 .tower/
 
+# Archived old code (single-agent implementation)
+.old_tower/
+
 .claude
 .env
 
