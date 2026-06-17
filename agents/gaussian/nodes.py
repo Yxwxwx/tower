@@ -1,200 +1,176 @@
-"""Gaussian agent nodes — each node is a pure function (state) → dict.
+"""Gaussian agent nodes — pre-computation and post-computation paths.
 
-Nodes:
-1. validate_params — validate GaussianParams before execution
-2. write_input — generate .gjf input file from template
-3. generate_slurm_template — create rough Slurm script for HPC refinement
-4. execute — run Gaussian (local or hand off to HPC)
-5. parse_output — parse .log for energy, convergence, errors
+LangGraph Pydantic state is immutable. Nodes return dict updates.
+scratchpad mutations must use {**state.scratchpad, key: value} pattern.
 """
-import json
-from datetime import datetime
-
 from contracts.gaussian_task import GaussianParams, GaussianResult
-from tower.state.artifact_registry import ArtifactRegistry
+from contracts.agent_task import Artifact, TaskStatus
+
+
+def _update_scratchpad(state, **kwargs) -> dict:
+    """Return a scratchpad update dict with new keys merged in."""
+    return {"scratchpad": {**state.scratchpad, **kwargs}}
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Node 1: Validate parameters
+# Pre-computation path
 # ═══════════════════════════════════════════════════════════════════
 
-def validate_params(state) -> dict:
-    """Validate GaussianParams before proceeding.
+def query_knowledge(state) -> dict:
+    """Query long-term memory for parameters, templates, known issues.
 
-    Checks enforced:
-    - method is non-empty
-    - basis is non-empty
-    - memory_mb > 0
-    - nprocs > 0
-
-    TODO: domain developer implements full validation logic.
+    TODO: domain developer wires MemoryRetriever to enrich params.
     """
-    task = state.task
-    if task is None:
-        return {
-            "status": state.status.__class__.FAILED,
-            "errors": ["No AgentTask provided"],
-        }
-
-    params: GaussianParams = task.params
-    errors = []
-
-    if not params.method.strip():
-        errors.append("method must be non-empty")
-    if not params.basis.strip():
-        errors.append("basis must be non-empty")
-    if params.memory_mb <= 0:
-        errors.append("memory_mb must be > 0")
-    if params.nprocs <= 0:
-        errors.append("nprocs must be > 0")
-
-    if errors:
-        return {"status": state.status.__class__.FAILED, "errors": errors}
-
-    state.scratchpad["params_validated"] = True
-    return {"node_history": state.node_history + ["validate_params"]}
+    return {
+        "node_history": state.node_history + ["query_knowledge"],
+        **_update_scratchpad(state, queried_db=True),
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Node 2: Write Gaussian input file
-# ═══════════════════════════════════════════════════════════════════
+def generate_input(state) -> dict:
+    """Generate .gjf input file from GaussianParams.
 
-def write_input(state) -> dict:
-    """Generate .gjf input file from GaussianParams + template.
-
-    Uses infra-mcp template.render tool to render the input file.
-    Writes result via infra-mcp filesystem.write.
-
-    TODO: domain developer implements actual MCP tool calls.
+    TODO: domain developer implements MCP template.render + filesystem.write.
     """
     task = state.task
     params: GaussianParams = task.params
 
-    # Render input from template (stub — domain dev implements)
-    input_content = _render_gaussian_input(params, task.task_id)
+    from agents.gaussian.prompts import GAUSSIAN_OPT_TEMPLATE
+    additional_kw = " ".join(f"{k}={v}" for k, v in params.additional_keywords.items())
 
-    # Write to workspace (stub — domain dev implements MCP call)
-    gjf_path = f"jobs/{task.task_id}/{task.task_id}.gjf"
+    content = GAUSSIAN_OPT_TEMPLATE.format(
+        memory_mb=params.memory_mb, nprocs=params.nprocs,
+        chk_name=task.task_id, method=params.method, basis=params.basis,
+        job_type=params.job_type, additional_kw=additional_kw,
+        title=task.goal, charge=params.charge, spin=params.spin,
+        geometry="",
+    )
 
-    state.scratchpad["gjf_path"] = gjf_path
-    state.scratchpad["gjf_content"] = input_content
+    return {
+        "node_history": state.node_history + ["generate_input"],
+        **_update_scratchpad(state,
+            gjf_content=content,
+            gjf_path=f"jobs/{task.task_id}/{task.task_id}.gjf",
+        ),
+    }
 
-    return {"node_history": state.node_history + ["write_input"]}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Node 3: Generate rough Slurm template
-# ═══════════════════════════════════════════════════════════════════
 
 def generate_slurm_template(state) -> dict:
-    """Create a rough Slurm script for the HPC agent to refine.
+    """Generate rough Slurm template for HPC refinement.
 
-    Includes #SBATCH directives for mem, cpus, walltime.
-    HPC agent refines with partition, account, node selection.
-
-    TODO: domain developer implements actual template rendering.
+    TODO: domain developer implements MCP template.render.
     """
     task = state.task
     params: GaussianParams = task.params
 
-    slurm_content = f"""#!/bin/bash
+    slurm = f"""#!/bin/bash
 #SBATCH --job-name={task.task_id}
 #SBATCH --mem={params.memory_mb}
 #SBATCH --cpus-per-task={params.nprocs}
 #SBATCH --time=24:00:00
-
-# Rough template — HPC agent refines partition, account, node constraints
+# ROUGH TEMPLATE — HPC agent refines partition/account/node
 
 g16 < {state.scratchpad.get('gjf_path', 'input.gjf')} > jobs/{task.task_id}/{task.task_id}.log
 """
 
-    slurm_path = f"jobs/{task.task_id}/{task.task_id}_rough.sh"
-    state.scratchpad["slurm_path"] = slurm_path
-    state.scratchpad["slurm_content"] = slurm_content
-
-    return {"node_history": state.node_history + ["generate_slurm_template"]}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Node 4: Execute
-# ═══════════════════════════════════════════════════════════════════
-
-def execute(state) -> dict:
-    """Execute Gaussian calculation.
-
-    Two modes:
-    a) Local execution: run g16 directly (for small test jobs)
-    b) HPC handoff: produce artifacts and let HPC agent submit
-
-    TODO: domain developer implements actual execution logic.
-    """
-    # For MVP: stub implementation — marks execution as complete
-    # Domain developer replaces with actual g16 call or HPC handoff
-    state.scratchpad["execution_mode"] = "stub"
-
-    return {"node_history": state.node_history + ["execute"]}
+    return {
+        "node_history": state.node_history + ["generate_slurm_template"],
+        **_update_scratchpad(state,
+            slurm_content=slurm,
+            slurm_path=f"jobs/{task.task_id}/{task.task_id}_rough.sh",
+        ),
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Node 5: Parse output
-# ═══════════════════════════════════════════════════════════════════
-
-def parse_output(state) -> dict:
-    """Parse Gaussian .log for energy, convergence, errors.
-
-    Extracts:
-    - SCF energy (final single-point)
-    - Convergence status (normal termination check)
-    - Imaginary frequencies (for freq jobs)
-    - Wall time
-
-    TODO: domain developer implements actual log parsing logic.
-    """
-    task = state.task
-    params: GaussianParams = task.params
-
-    # Stub result — domain developer replaces with actual parsing
-    result_data = GaussianResult(
-        energy=None,       # parse from "SCF Done:" line
-        dipole=None,       # parse from dipole moment section
-        n_imag_freq=0,     # parse from frequency section
-        converged=False,   # check for "Normal termination"
-        checkpoint_path=None,
-        wall_time_s=0.0,
-    )
-
-    # Register artifacts (stub — actual paths from real execution)
-    # Domain developer registers actual produced files
+def pre_compute_done(state) -> dict:
+    """Pre-computation complete. Return artifacts to supervisor."""
+    task_id = state.task_id
 
     return {
-        "result_data": result_data,
-        "status": state.status.__class__.DONE,
-        "node_history": state.node_history + ["parse_output"],
+        "status": TaskStatus.DONE,
+        "artifacts_out": [
+            Artifact(artifact_id=f"{task_id}-gjf",
+                     path=state.scratchpad["gjf_path"], type="gjf",
+                     description="Gaussian input file",
+                     producer_agent="gaussian", producer_task_id=task_id),
+            Artifact(artifact_id=f"{task_id}-slurm",
+                     path=state.scratchpad["slurm_path"], type="slurm",
+                     description="Rough Slurm template for HPC refinement",
+                     producer_agent="gaussian", producer_task_id=task_id),
+        ],
+        "node_history": state.node_history + ["pre_compute_done"],
     }
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Helpers (domain developer expands these)
+# Post-computation path
 # ═══════════════════════════════════════════════════════════════════
 
-def _render_gaussian_input(params: GaussianParams, task_id: str) -> str:
-    """Render .gjf content from params. Stub — domain dev implements."""
-    from agents.gaussian.prompts import GAUSSIAN_OPT_TEMPLATE
+def read_output(state) -> dict:
+    """Read Gaussian .log and .fchk from HPC output.
 
-    additional_kw = " ".join(
-        f"{k}={v}" for k, v in params.additional_keywords.items()
-    )
+    Artifacts come via task.artifacts_in (passed by supervisor).
+    """
+    log_id = ""
+    fchk_id = ""
+    for ref in state.task.artifacts_in:
+        if ref.type == "log":
+            log_id = ref.artifact_id
+        elif ref.type == "fchk":
+            fchk_id = ref.artifact_id
 
-    return GAUSSIAN_OPT_TEMPLATE.format(
-        memory_mb=params.memory_mb,
-        nprocs=params.nprocs,
-        chk_name=task_id,
-        method=params.method,
-        basis=params.basis,
-        job_type=params.job_type,
-        additional_kw=additional_kw,
-        title=task_id,
-        charge=params.charge,
-        spin=params.spin,
-        geometry="",  # TODO: domain dev provides geometry
+    return {
+        "node_history": state.node_history + ["read_output"],
+        **_update_scratchpad(state, log_artifact_id=log_id, fchk_artifact_id=fchk_id),
+    }
+
+
+def parse_energy(state) -> dict:
+    """Parse Gaussian .log for SCF energy, convergence.
+
+    TODO: domain developer implements actual log parsing.
+    """
+    result_data = GaussianResult(
+        energy=None,
+        dipole=None,
+        n_imag_freq=0,
+        converged=True,
+        checkpoint_path=state.scratchpad.get("fchk_artifact_id"),
+        wall_time_s=0.0,
     )
+    return {
+        "result_data": result_data,
+        "node_history": state.node_history + ["parse_energy"],
+    }
+
+
+def register_artifacts(state) -> dict:
+    """Register .log/.fchk as artifacts for downstream agents.
+
+    In post-computation, log/fchk paths are resolved via ArtifactResolver
+    from the artifact_ids in state.scratchpad. The artifacts themselves
+    were created on disk by HPC execution.
+    """
+    artifacts = []
+    log_id = state.scratchpad.get("log_artifact_id", "")
+    fchk_id = state.scratchpad.get("fchk_artifact_id", "")
+
+    if log_id:
+        # Path resolved from RunState.artifacts via ArtifactResolver
+        artifacts.append(Artifact(
+            artifact_id=log_id, path=f"jobs/{state.task_id}/{state.task_id}.log",
+            type="log", description="Gaussian output log",
+            producer_agent="gaussian", producer_task_id=state.task_id,
+        ))
+    if fchk_id:
+        artifacts.append(Artifact(
+            artifact_id=fchk_id, path=f"jobs/{state.task_id}/{state.task_id}.fchk",
+            type="fchk", description="Gaussian checkpoint",
+            producer_agent="gaussian", producer_task_id=state.task_id,
+        ))
+
+    return {
+        "status": TaskStatus.DONE,
+        "artifacts_out": artifacts,
+        "node_history": state.node_history + ["register_artifacts"],
+    }

@@ -1,11 +1,11 @@
-"""PySCF agent — stub skeleton.
+"""PySCF agent — pre-computation (generate script) and post-computation (parse output).
 
-TODO: Domain developer implements:
-- read_fchk: read Gaussian checkpoint via ArtifactResolver
-- select_orbitals: select active space, write active_orbitals.json
-- run_casscf: execute CASSCF, write casscf_energy.json
-- generate_slurm_template: rough Slurm for HPC
+Same conditional routing pattern as gaussian agent:
+- artifacts_in empty → pre: read fchk, select orbitals, generate CASSCF script
+- artifacts_in has log → post: parse CASSCF energy, register orbital info artifact
 """
+from typing import Literal
+
 from langgraph.graph import StateGraph, START, END
 
 from contracts.pyscf_task import PySCFParams, PySCFResult
@@ -13,29 +13,113 @@ from tower_agent_kit.base import BaseAgentState, AgentRegistration, RetryPolicy
 
 
 class PySCFState(BaseAgentState[PySCFParams, PySCFResult]):
-    """PySCF agent internal state."""
-    fchk_read: bool = False
-    orbitals_selected: bool = False
-    casscf_done: bool = False
+    pass
 
 
-def stub_node(state: PySCFState) -> dict:
-    """Stub — domain developer replaces with real implementation."""
-    state.scratchpad["stub"] = True
+# ═══════════════════════════════════════════════════════════════════
+# Pre-computation nodes (TODO: domain developer implements)
+# ═══════════════════════════════════════════════════════════════════
+
+def read_fchk(state: PySCFState) -> dict:
+    """Read Gaussian checkpoint via ArtifactResolver. Extract MO coefficients."""
+    state.scratchpad["fchk_read"] = True
+    return {"node_history": state.node_history + ["read_fchk"]}
+
+
+def select_orbitals(state: PySCFState) -> dict:
+    """Select active space orbitals. Write active_orbitals.json."""
+    state.scratchpad["orbitals_selected"] = True
+    return {"node_history": state.node_history + ["select_orbitals"]}
+
+
+def generate_slurm(state: PySCFState) -> dict:
+    """Generate rough Slurm template for HPC refinement."""
+    state.scratchpad["slurm_generated"] = True
+    return {"node_history": state.node_history + ["generate_slurm"]}
+
+
+def pre_done(state: PySCFState) -> dict:
+    from contracts.agent_task import Artifact, TaskStatus
+    state.artifacts_out = [
+        Artifact(artifact_id=f"{state.task_id}-orbitals", type="json",
+                 description="Active orbital selection", producer_agent="pyscf",
+                 producer_task_id=state.task_id),
+        Artifact(artifact_id=f"{state.task_id}-slurm", type="slurm",
+                 description="Rough Slurm template", producer_agent="pyscf",
+                 producer_task_id=state.task_id),
+    ]
+    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["pre_done"]}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Post-computation nodes (TODO: domain developer implements)
+# ═══════════════════════════════════════════════════════════════════
+
+def read_output(state: PySCFState) -> dict:
+    """Read CASSCF output log and orbital JSON."""
+    return {"node_history": state.node_history + ["read_output"]}
+
+
+def parse_energy(state: PySCFState) -> dict:
+    """Parse CASSCF energy and CI coefficients from log."""
     return {
-        "status": state.status.__class__.DONE,
         "result_data": PySCFResult(),
-        "node_history": state.node_history + ["stub"],
+        "node_history": state.node_history + ["parse_energy"],
     }
 
 
-pyscf_graph = (
-    StateGraph(PySCFState)
-    .add_node("stub", stub_node)
-    .add_edge(START, "stub")
-    .add_edge("stub", END)
-    .compile()
-)
+def register_artifacts(state: PySCFState) -> dict:
+    """Register CASSCF output as artifacts for downstream (orca agent)."""
+    from contracts.agent_task import Artifact, TaskStatus
+    state.artifacts_out = [
+        Artifact(artifact_id=f"{state.task_id}-casscf", type="json",
+                 description="CASSCF energy + orbital info",
+                 producer_agent="pyscf", producer_task_id=state.task_id),
+    ]
+    return {"status": TaskStatus.DONE, "node_history": state.node_history + ["register_artifacts"]}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Routing
+# ═══════════════════════════════════════════════════════════════════
+
+def route_entry(state: PySCFState) -> Literal["pre", "post"]:
+    if state.task is None:
+        return "pre"
+    for ref in state.task.artifacts_in:
+        if ref.type in ("log", "json"):
+            return "post"
+    return "pre"
+
+
+# ═══════════════════════════════════════════════════════════════════
+
+def build_pyscf_graph() -> StateGraph:
+    graph = StateGraph(PySCFState)
+
+    graph.add_node("read_fchk", read_fchk)
+    graph.add_node("select_orbitals", select_orbitals)
+    graph.add_node("generate_slurm", generate_slurm)
+    graph.add_node("pre_done", pre_done)
+    graph.add_node("read_output", read_output)
+    graph.add_node("parse_energy", parse_energy)
+    graph.add_node("register_artifacts", register_artifacts)
+
+    graph.add_conditional_edges(START, route_entry, {"pre": "read_fchk", "post": "read_output"})
+
+    graph.add_edge("read_fchk", "select_orbitals")
+    graph.add_edge("select_orbitals", "generate_slurm")
+    graph.add_edge("generate_slurm", "pre_done")
+    graph.add_edge("pre_done", END)
+
+    graph.add_edge("read_output", "parse_energy")
+    graph.add_edge("parse_energy", "register_artifacts")
+    graph.add_edge("register_artifacts", END)
+
+    return graph
+
+
+pyscf_graph = build_pyscf_graph().compile()
 
 
 def register() -> AgentRegistration:
@@ -43,7 +127,10 @@ def register() -> AgentRegistration:
         name="pyscf",
         subgraph=pyscf_graph,
         retry_policy=RetryPolicy(is_idempotent=True, max_retries=2),
-        timeout_s=120,  # 读fchk + 选轨道 + CASSCF脚本生成，秒级完成
+        timeout_s=120,
         dependencies=set(),
-        description="PySCF CASSCF agent — orbital selection and multi-reference computation",
+        description=(
+            "PySCF CASSCF agent. Pre: read fchk → select orbitals → generate script. "
+            "Post: parse CASSCF energy → register orbital info artifact."
+        ),
     )
