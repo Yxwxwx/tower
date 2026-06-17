@@ -6,6 +6,7 @@ successful pipelines, and user preferences.
 MVP: type-filtered key-value lookup (no embedding vectors).
 Post-MVP: pgvector semantic search.
 """
+
 from typing import TYPE_CHECKING
 
 from tower.memory.models import MemoryRecord, MemoryType
@@ -27,33 +28,38 @@ class MemoryRetriever:
         self.ltm = ltm
 
     async def get_failure_patterns(
-        self, agent: str | None = None, limit: int = 10,
+        self,
+        agent: str | None = None,
+        limit: int = 10,
     ) -> list[MemoryRecord]:
         """Get known failure patterns, optionally filtered by agent."""
         records = await self.ltm.search_by_type(
-            MemoryType.FAILURE_PATTERN, limit=limit,
+            MemoryType.FAILURE_PATTERN,
+            limit=limit,
         )
         if agent:
-            records = [
-                r for r in records
-                if agent.lower() in r.content.lower()
-            ]
+            records = [r for r in records if agent.lower() in r.content.lower()]
         return records
 
     async def get_successful_pipelines(self, limit: int = 5) -> list[MemoryRecord]:
         """Get pipelines that completed successfully."""
         return await self.ltm.search_by_type(
-            MemoryType.SUCCESSFUL_PIPELINE, limit=limit,
+            MemoryType.SUCCESSFUL_PIPELINE,
+            limit=limit,
         )
 
     async def get_user_preferences(self, limit: int = 20) -> list[MemoryRecord]:
         """Get user preference records."""
         return await self.ltm.search_by_type(
-            MemoryType.USER_PREFERENCE, limit=limit,
+            MemoryType.USER_PREFERENCE,
+            limit=limit,
         )
 
     async def get_all_relevant(
-        self, task: str, agent: str | None = None, limit: int = 10,
+        self,
+        task: str,
+        agent: str | None = None,
+        limit: int = 10,
     ) -> dict[str, list[MemoryRecord]]:
         """Get all relevant memories for a task.
 

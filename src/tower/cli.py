@@ -2,6 +2,7 @@
 
 Rendering stack: Click (CLI framework) + Rich (terminal rendering).
 """
+
 import asyncio
 import sys
 import time
@@ -9,23 +10,20 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import click
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
 # Ensure agents/ is importable (project root on sys.path)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import click
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-from rich.live import Live
-from rich.layout import Layout
-from rich.rule import Rule
-from rich.columns import Columns
-from rich import box
-
-from tower.state.run_store import RunState, RunStateStore
+from tower.state.run_store import RunState, RunStateStore  # noqa: E402
 
 console = Console()
 
@@ -42,7 +40,7 @@ TOWER_BANNER = r"""
       ╚═╝    ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝[/]
 [dim]      Supervisor-led Modular Multi-Agent System for Computational Chemistry[/]
 
-[dim]   version 0.2.0  ·  LangGraph + MCP  ·  contracts v1[/]
+[dim]   version 0.0.1  ·  LangGraph + MCP  ·  contracts v1[/]
 """
 
 
@@ -55,21 +53,21 @@ def _print_banner():
 # ═══════════════════════════════════════════════════════════════════
 
 STATUS_COLORS = {
-    "pending":   "dim",
-    "running":   "bold yellow",
-    "done":      "bold green",
-    "failed":    "bold red",
-    "retrying":  "bold magenta",
+    "pending": "dim",
+    "running": "bold yellow",
+    "done": "bold green",
+    "failed": "bold red",
+    "retrying": "bold magenta",
     "abandoned": "red",
     "needs_human": "bold yellow",
 }
 
 STATUS_ICONS = {
-    "pending":   "○",
-    "running":   "◌",
-    "done":      "●",
-    "failed":    "✕",
-    "retrying":  "↺",
+    "pending": "○",
+    "running": "◌",
+    "done": "●",
+    "failed": "✕",
+    "retrying": "↺",
     "abandoned": "✕",
     "needs_human": "?",  # filled by _needs_human logic
 }
@@ -96,6 +94,7 @@ def _agent_name_cell(name: str) -> Text:
 # Agent listing (tower agents)
 # ═══════════════════════════════════════════════════════════════════
 
+
 def _render_agent_list(registrations: list) -> Table:
     """Render registered agents as a Rich Table."""
     table = Table(
@@ -111,11 +110,17 @@ def _render_agent_list(registrations: list) -> Table:
     table.add_column("Timeout", justify="right", width=10)
     table.add_column("Description", width=66)
 
-    for r in sorted(registrations, key=lambda x: (
-        0 if x.name == "supervisor" else
-        1 if x.name in ("gaussian", "pyscf", "orca") else 2,
-        x.name,
-    )):
+    for r in sorted(
+        registrations,
+        key=lambda x: (
+            0
+            if x.name == "supervisor"
+            else 1
+            if x.name in ("gaussian", "pyscf", "orca")
+            else 2,
+            x.name,
+        ),
+    ):
         if r.name in ("hpc", "monitor"):
             agent_type = "[magenta]infra[/]"
         elif r.name == "supervisor":
@@ -123,7 +128,9 @@ def _render_agent_list(registrations: list) -> Table:
         else:
             agent_type = "[green]domain[/]"
 
-        timeout = f"{r.timeout_s // 3600}h" if r.timeout_s >= 3600 else f"{r.timeout_s}s"
+        timeout = (
+            f"{r.timeout_s // 3600}h" if r.timeout_s >= 3600 else f"{r.timeout_s}s"
+        )
 
         table.add_row(
             _agent_name_cell(r.name),
@@ -140,6 +147,7 @@ def _render_agent_list(registrations: list) -> Table:
 # Run execution rendering
 # ═══════════════════════════════════════════════════════════════════
 
+
 def _render_run_header(run_id: str, trace_id: str, task: str):
     """Render the run start panel."""
     grid = Table.grid(padding=(0, 2))
@@ -151,12 +159,14 @@ def _render_run_header(run_id: str, trace_id: str, task: str):
     grid.add_row("Time", f"[dim]{time.strftime('%Y-%m-%d %H:%M:%S')}[/]")
 
     console.print()
-    console.print(Panel(
-        grid,
-        title="[bold blue]⚛ Tower Run[/]",
-        border_style="blue",
-        padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            grid,
+            title="[bold blue]⚛ Tower Run[/]",
+            border_style="blue",
+            padding=(1, 2),
+        )
+    )
 
 
 def _render_plan(plan: list[str]):
@@ -172,8 +182,13 @@ def _render_plan(plan: list[str]):
 
     console.print()
     console.print(
-        Panel(Text.assemble(*parts),
-              title="[bold]Plan[/]", border_style="green", padding=(1, 2)))
+        Panel(
+            Text.assemble(*parts),
+            title="[bold]Plan[/]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
 
 
 def _render_agent_result(agent_name: str, status: str, data=None, errors=None):
@@ -198,18 +213,22 @@ def _render_agent_result(agent_name: str, status: str, data=None, errors=None):
     console.print(f"  {_agent_name_cell(agent_name)}  {' '.join(lines)}")
 
 
-def _render_final_result(final_response: str, plan: list[str], node_history: list[str] = None):
+def _render_final_result(
+    final_response: str, plan: list[str], node_history: list[str] = None
+):
     """Render the final result panel."""
     console.print()
     console.print(Rule(style="green"))
 
     if final_response:
-        console.print(Panel(
-            final_response,
-            title="[bold green]Result[/]",
-            border_style="green",
-            padding=(1, 2),
-        ))
+        console.print(
+            Panel(
+                final_response,
+                title="[bold green]Result[/]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
 
     # Footer
     footer = Text()
@@ -225,6 +244,7 @@ def _render_final_result(final_response: str, plan: list[str], node_history: lis
 # CLI commands
 # ═══════════════════════════════════════════════════════════════════
 
+
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx):
@@ -233,12 +253,14 @@ def cli(ctx):
         _print_banner()
         console.print()
         console.print("[dim]Commands:[/]")
-        console.print("  [bold]tower run[/] <task>     Execute a computational chemistry task")
+        console.print(
+            "  [bold]tower run[/] <task>     Execute a computational chemistry task"
+        )
         console.print("  [bold]tower agents[/]           List all registered agents")
         console.print()
         console.print("[dim]Examples:[/]")
-        console.print("  [dim]$[/] tower run \"N2 NEVPT2 calculation\"")
-        console.print("  [dim]$[/] tower run \"H4 chain DMRG with M=200\"")
+        console.print('  [dim]$[/] tower run "N2 NEVPT2 calculation"')
+        console.print('  [dim]$[/] tower run "H4 chain DMRG with M=200"')
         console.print("  [dim]$[/] tower agents")
 
 
@@ -267,15 +289,19 @@ def run(task: str, run_id: Optional[str]):
         from agents.monitor import register as mo_reg
 
         agents = {
-            r.name: r for r in [
-                sv_reg(), ga_reg(), py_reg(), or_reg(), hp_reg(), mo_reg(),
+            r.name: r
+            for r in [
+                sv_reg(),
+                ga_reg(),
+                py_reg(),
+                or_reg(),
+                hp_reg(),
+                mo_reg(),
             ]
         }
 
         # Show loaded agents
-        agent_list = ", ".join(
-            str(_agent_name_cell(n)) for n in agents
-        )
+        agent_list = ", ".join(str(_agent_name_cell(n)) for n in agents)
         console.print(f"  [dim]agents:[/] {agent_list}")
 
         # Invoke supervisor
@@ -297,12 +323,11 @@ def run(task: str, run_id: Optional[str]):
             if agent_name not in agents or agent_name == "supervisor":
                 continue
 
-            agent_reg = agents[agent_name]
-            step_label = f"[bold]{agent_name}[/] ({i+1}/{len(plan)})"
+            step_label = f"[bold]{agent_name}[/] ({i + 1}/{len(plan)})"
 
             with console.status(f"  {step_label} [dim]executing...[/]", spinner="dots"):
                 time.sleep(0.3)  # MVP: simulate execution
-                # In production: agent_reg.subgraph.invoke(state)
+                # In production: agents[agent_name].subgraph.invoke(state)
 
             _render_agent_result(agent_name, "done")
 
@@ -325,7 +350,12 @@ def agents():
     from agents.monitor import register as mo_reg
 
     registrations = [
-        sv_reg(), ga_reg(), py_reg(), or_reg(), hp_reg(), mo_reg(),
+        sv_reg(),
+        ga_reg(),
+        py_reg(),
+        or_reg(),
+        hp_reg(),
+        mo_reg(),
     ]
 
     console.print()
@@ -334,14 +364,16 @@ def agents():
 
     # Architecture note
     console.print()
-    console.print(Panel(
-        "[dim]All agents are independent. The [cyan]supervisor[/] alone decides "
-        "execution order and data flow. Agents have no knowledge of each other — "
-        "the supervisor passes artifacts between them via [bold]artifacts_in[/].[/]",
-        title="[bold]Architecture[/]",
-        border_style="dim blue",
-        padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            "[dim]All agents are independent. The [cyan]supervisor[/] alone decides "
+            "execution order and data flow. Agents have no knowledge of each other — "
+            "the supervisor passes artifacts between them via [bold]artifacts_in[/].[/]",
+            title="[bold]Architecture[/]",
+            border_style="dim blue",
+            padding=(1, 2),
+        )
+    )
 
 
 def main():

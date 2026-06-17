@@ -3,6 +3,7 @@
 每次 graph.ainvoke() 后 LangGraph 自动保存 checkpoint。
 相同 thread_id 可恢复历史会话。
 """
+
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from tower.memory.pool import get_pool
 

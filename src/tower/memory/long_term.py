@@ -3,6 +3,7 @@
 LangGraph Store 原生支持 PostgreSQL + pgvector。
 使用 ("users", user_id) 作为 namespace 隔离不同用户。
 """
+
 import hashlib
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from tower.memory.pool import get_pool
@@ -38,7 +39,9 @@ class LongTermMemory:
             return None
         return item.value if hasattr(item, "value") else item.get("value", {})
 
-    async def search(self, filter_keys: list[str] | None = None, limit: int = 50) -> list[dict]:
+    async def search(
+        self, filter_keys: list[str] | None = None, limit: int = 50
+    ) -> list[dict]:
         """搜索记忆，可按 key 过滤。"""
         await self._ensure_setup()
         items = await self._store.asearch(self._namespace, limit=limit)
@@ -57,7 +60,9 @@ class LongTermMemory:
         for item in items:
             v = item.value if hasattr(item, "value") else item.get("value", {})
             if isinstance(v, dict) and "fact" in v:
-                facts.append({"fact": v["fact"], "category": v.get("category", "general")})
+                facts.append(
+                    {"fact": v["fact"], "category": v.get("category", "general")}
+                )
         return facts
 
     async def add_fact(self, fact: str, category: str = "general"):
@@ -116,7 +121,10 @@ class LongTermMemory:
         return record.memory_id
 
     async def search_by_type(
-        self, memory_type, limit: int = 50, **filters,
+        self,
+        memory_type,
+        limit: int = 50,
+        **filters,
     ) -> list:
         """Type-filtered search without embedding.
 
@@ -147,6 +155,7 @@ class LongTermMemory:
         existing = await self.get(memory_id)
         if existing:
             from datetime import datetime
+
             existing["last_accessed_at"] = datetime.now().isoformat()
             existing["access_count"] = existing.get("access_count", 0) + 1
             await self.put(memory_id, existing)

@@ -47,7 +47,7 @@ def register() -> AgentRegistration:
             requires_cleanup_before_retry=True,
             cleanup_steps=["scancel old jobs", "remove stale Slurm scripts"],
         ),
-        timeout_s=600,
+        timeout_s=60,  # squeue查询 + slurm精化 + sbatch，秒级完成
         dependencies=set(),  # no chemical dependencies — dispatched in parallel
         description="HPC infrastructure agent — Slurm generation, resource query, job submission",
     )

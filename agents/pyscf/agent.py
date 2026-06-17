@@ -43,7 +43,7 @@ def register() -> AgentRegistration:
         name="pyscf",
         subgraph=pyscf_graph,
         retry_policy=RetryPolicy(is_idempotent=True, max_retries=2),
-        timeout_s=3600,
+        timeout_s=120,  # 读fchk + 选轨道 + CASSCF脚本生成，秒级完成
         dependencies=set(),
         description="PySCF CASSCF agent — orbital selection and multi-reference computation",
     )

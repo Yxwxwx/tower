@@ -93,7 +93,7 @@ def register() -> AgentRegistration:
             max_retries=2,
             escalate_after_max=True,
         ),
-        timeout_s=3600,
+        timeout_s=120,  # 生成输入文件 + 粗糙slurm模板，秒级完成
         dependencies=set(),  # no upstream dependencies
         description=(
             "Gaussian computational chemistry agent. "

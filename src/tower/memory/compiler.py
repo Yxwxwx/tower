@@ -7,6 +7,7 @@ Principles:
 - Memory must be compressed: patterns, not raw logs.
 - Memory is event-derived: compiler reads events. Agents NEVER write memory directly.
 """
+
 import hashlib
 from typing import TYPE_CHECKING
 
@@ -103,13 +104,15 @@ class MemoryCompiler:
                     f"{'Fixed by retry.' if was_fixed else 'Not resolved.'}"
                 )
 
-                records.append(MemoryRecord(
-                    memory_id=_hash_id(content),
-                    trace_id=run_state.trace_id,
-                    content=content,
-                    memory_type=MemoryType.FAILURE_PATTERN,
-                    confidence=confidence,
-                ))
+                records.append(
+                    MemoryRecord(
+                        memory_id=_hash_id(content),
+                        trace_id=run_state.trace_id,
+                        content=content,
+                        memory_type=MemoryType.FAILURE_PATTERN,
+                        confidence=confidence,
+                    )
+                )
         return records
 
     @staticmethod
@@ -117,6 +120,7 @@ class MemoryCompiler:
         """Check if an error was later resolved by retry."""
         agent = event.agent
         from contracts.agent_task import TaskStatus
+
         for task_id, status in run_state.agent_tasks.items():
             if agent in task_id and status == TaskStatus.DONE:
                 return True

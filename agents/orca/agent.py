@@ -40,7 +40,7 @@ def register() -> AgentRegistration:
         name="orca",
         subgraph=orca_graph,
         retry_policy=RetryPolicy(is_idempotent=True, max_retries=2),
-        timeout_s=7200,
+        timeout_s=120,  # 读轨道 + 生成.inp + 粗糙slurm，秒级完成
         dependencies=set(),
         description="Orca NEVPT2/CC agent — post-HF multi-reference computation",
     )
