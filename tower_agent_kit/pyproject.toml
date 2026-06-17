@@ -1,0 +1,17 @@
+[project]
+name = "tower-agent-kit"
+version = "0.1.0"
+description = "Lightweight scaffold for building Tower agents"
+requires-python = ">=3.12"
+dependencies = [
+    "tower-contracts>=0.1.0",
+    "langgraph>=1.0.0",
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

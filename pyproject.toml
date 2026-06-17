@@ -1,9 +1,9 @@
 [project]
 name = "tower"
-version = "0.1.0"
-description = "A general-purpose agent framework with Plan→Act→Observe→Refine→Respond orchestration"
+version = "0.2.0"
+description = "Supervisor-led modular multi-agent system for computational chemistry"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "langgraph",
     "langgraph-checkpoint-postgres>=3.1.0",
@@ -15,10 +15,16 @@ dependencies = [
     "prompt-toolkit",
     "psycopg[binary]>=3.3.4",
     "psycopg-pool>=3.3.1",
+    "tower-contracts",
+    "tower-agent-kit",
 ]
 
+[tool.uv.sources]
+tower-contracts = { path = "contracts", editable = true }
+tower-agent-kit = { path = "tower_agent_kit", editable = true }
+
 [project.scripts]
-tower = "tower.main:main"
+tower = "tower.cli:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]

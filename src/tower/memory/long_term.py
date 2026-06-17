@@ -85,3 +85,68 @@ class LongTermMemory:
         items = await self._store.asearch(self._namespace, limit=1000)
         for item in items:
             await self._store.adelete(self._namespace, item.key)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Memory OS — add_record, search_by_type, mark_accessed
+    # ═══════════════════════════════════════════════════════════════
+
+    async def add_record(self, record) -> str | None:
+        """Add a MemoryRecord with deduplication.
+
+        Returns memory_id if stored, None if duplicate.
+        On duplicate: averages confidence scores.
+        """
+        from tower.memory.models import MemoryRecord
+
+        await self._ensure_setup()
+
+        existing = await self.get(record.memory_id)
+        if existing is not None:
+            # Update confidence: average
+            old_conf = existing.get("confidence", 1.0)
+            if isinstance(record, MemoryRecord):
+                record.confidence = (old_conf + record.confidence) / 2
+            # Update access metadata
+            existing["last_accessed_at"] = record.last_accessed_at
+            existing["access_count"] = existing.get("access_count", 0) + 1
+            await self.put(record.memory_id, existing)
+            return None  # duplicate
+
+        await self.put(record.memory_id, record.model_dump())
+        return record.memory_id
+
+    async def search_by_type(
+        self, memory_type, limit: int = 50, **filters,
+    ) -> list:
+        """Type-filtered search without embedding.
+
+        Args:
+            memory_type: MemoryType enum value or string.
+            limit: Max records to return.
+            **filters: Additional key-value filters on record fields.
+
+        Returns:
+            List of MemoryRecord objects.
+        """
+        from tower.memory.models import MemoryRecord
+
+        await self._ensure_setup()
+        items = await self._store.asearch(self._namespace, limit=limit * 3)
+        records = []
+        for item in items:
+            v = item.value if hasattr(item, "value") else item.get("value", {})
+            if isinstance(v, dict) and v.get("memory_type") == memory_type:
+                try:
+                    records.append(MemoryRecord(**v))
+                except Exception:
+                    continue
+        return records[:limit]
+
+    async def mark_accessed(self, memory_id: str):
+        """Update access metadata for a memory record."""
+        existing = await self.get(memory_id)
+        if existing:
+            from datetime import datetime
+            existing["last_accessed_at"] = datetime.now().isoformat()
+            existing["access_count"] = existing.get("access_count", 0) + 1
+            await self.put(memory_id, existing)

@@ -1,0 +1,15 @@
+[project]
+name = "tower-contracts"
+version = "0.1.0"
+description = "Tower multi-agent system — frozen Pydantic communication schemas"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
