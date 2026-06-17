@@ -1,8 +1,17 @@
-"""PySCF agent — pre-computation (generate script) and post-computation (parse output).
+"""PySCF agent — RHF/DFT and CASSCF with pre/post routing.
 
-Same conditional routing pattern as gaussian agent:
-- artifacts_in empty → pre: read fchk, select orbitals, generate CASSCF script
-- artifacts_in has log → post: parse CASSCF energy, register orbital info artifact
+Pre-computation:
+- n_active_electrons==0 → RHF/DFT: generate_rhf_input → generate_slurm → pre_done
+- n_active_electrons>0  → CASSCF: read_fchk → select_orbitals → generate_casscf_input
+                          → generate_slurm → pre_done
+
+Post-computation (shared):
+- read_output → parse_energy → register_artifacts
+
+Routing:
+- artifacts_in has log → post path
+- params.job_type==CASSCF → CASSCF pre path
+- else → RHF/DFT pre path
 """
 from typing import Literal
 
@@ -10,6 +19,20 @@ from langgraph.graph import StateGraph, START, END
 
 from contracts.pyscf_task import PySCFParams, PySCFResult
 from tower_agent_kit.base import BaseAgentState, AgentRegistration, RetryPolicy
+from agents.pyscf.nodes import (
+    # RHF/DFT
+    generate_rhf_input,
+    # CASSCF
+    read_fchk,
+    select_orbitals,
+    generate_casscf_input,
+    # Shared
+    generate_slurm,
+    pre_done,
+    read_output,
+    parse_energy,
+    register_artifacts,
+)
 
 
 class PySCFState(BaseAgentState[PySCFParams, PySCFResult]):
@@ -17,117 +40,71 @@ class PySCFState(BaseAgentState[PySCFParams, PySCFResult]):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Pre-computation nodes (TODO: domain developer implements)
-# ═══════════════════════════════════════════════════════════════════
-
-def read_fchk(state: PySCFState) -> dict:
-    """Read Gaussian checkpoint via ArtifactResolver. Extract MO coefficients."""
-    state.scratchpad["fchk_read"] = True
-    return {"node_history": state.node_history + ["read_fchk"]}
-
-
-def select_orbitals(state: PySCFState) -> dict:
-    """Select active space orbitals. Write active_orbitals.json."""
-    state.scratchpad["orbitals_selected"] = True
-    return {"node_history": state.node_history + ["select_orbitals"]}
-
-
-def generate_slurm(state: PySCFState) -> dict:
-    """Generate rough Slurm template for HPC refinement."""
-    state.scratchpad["slurm_generated"] = True
-    return {"node_history": state.node_history + ["generate_slurm"]}
-
-
-def pre_done(state: PySCFState) -> dict:
-    from contracts.agent_task import Artifact, TaskStatus
-    return {
-        "status": TaskStatus.DONE,
-        "artifacts_out": [
-            Artifact(artifact_id=f"{state.task_id}-orbitals",
-                     path=f"jobs/{state.task_id}/active_orbitals.json",
-                     type="json", description="Active orbital selection",
-                     producer_agent="pyscf", producer_task_id=state.task_id),
-            Artifact(artifact_id=f"{state.task_id}-slurm",
-                     path=f"jobs/{state.task_id}/pyscf_rough.sh",
-                     type="slurm", description="Rough Slurm template",
-                     producer_agent="pyscf", producer_task_id=state.task_id),
-        ],
-        "node_history": state.node_history + ["pre_done"],
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Post-computation nodes (TODO: domain developer implements)
-# ═══════════════════════════════════════════════════════════════════
-
-def read_output(state: PySCFState) -> dict:
-    """Read CASSCF output log and orbital JSON."""
-    return {"node_history": state.node_history + ["read_output"]}
-
-
-def parse_energy(state: PySCFState) -> dict:
-    """Parse CASSCF energy and CI coefficients from log."""
-    return {
-        "result_data": PySCFResult(),
-        "node_history": state.node_history + ["parse_energy"],
-    }
-
-
-def register_artifacts(state: PySCFState) -> dict:
-    """Register CASSCF output as artifacts for downstream (orca agent)."""
-    from contracts.agent_task import Artifact, ArtifactStatus, TaskStatus
-    return {
-        "status": TaskStatus.DONE,
-        "artifacts_out": [
-            Artifact(artifact_id=f"{state.task_id}-casscf",
-                     path="", type="json",  # path resolved via ArtifactResolver
-                     description="CASSCF energy + orbital info",
-                     producer_agent="pyscf", producer_task_id=state.task_id,
-                     status=ArtifactStatus.READY),
-        ],
-        "node_history": state.node_history + ["register_artifacts"],
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
 # Routing
 # ═══════════════════════════════════════════════════════════════════
 
-def route_entry(state: PySCFState) -> Literal["pre", "post"]:
-    if state.task is None:
-        return "pre"
-    for ref in state.task.artifacts_in:
-        if ref.type in ("log", "json"):
-            return "post"
-    return "pre"
+def route_entry(state: PySCFState) -> Literal["post", "pre_rhf", "pre_casscf"]:
+    """Route to correct path based on context.
 
+    - Has log artifact → post-computation
+    - CASSCF params → pre CASSCF path
+    - Otherwise → pre RHF/DFT path
+    """
+    if state.task is not None:
+        for ref in state.task.artifacts_in:
+            if ref.type in ("log",):
+                return "post"
 
-def _finalize(state: PySCFState) -> dict:
-    result = state.to_agent_result("pyscf")
-    return {"agent_result": result}
+        params = state.task.params
+        if params.job_type == "CASSCF" or params.n_active_electrons > 0:
+            return "pre_casscf"
+
+    return "pre_rhf"
 
 
 # ═══════════════════════════════════════════════════════════════════
+
+def _finalize(state: PySCFState) -> dict:
+    return {"agent_result": state.to_agent_result("pyscf")}
+
 
 def build_pyscf_graph() -> StateGraph:
     graph = StateGraph(PySCFState)
 
+    # Pre nodes
+    graph.add_node("generate_rhf_input", generate_rhf_input)
     graph.add_node("read_fchk", read_fchk)
     graph.add_node("select_orbitals", select_orbitals)
+    graph.add_node("generate_casscf_input", generate_casscf_input)
     graph.add_node("generate_slurm", generate_slurm)
     graph.add_node("pre_done", pre_done)
+
+    # Post nodes
     graph.add_node("read_output", read_output)
     graph.add_node("parse_energy", parse_energy)
     graph.add_node("register_artifacts", register_artifacts)
+
+    # Finalize
     graph.add_node("finalize", _finalize)
 
-    graph.add_conditional_edges(START, route_entry, {"pre": "read_fchk", "post": "read_output"})
+    # Entry routing
+    graph.add_conditional_edges(START, route_entry, {
+        "post": "read_output",
+        "pre_rhf": "generate_rhf_input",
+        "pre_casscf": "read_fchk",
+    })
 
+    # RHF/DFT pre chain
+    graph.add_edge("generate_rhf_input", "generate_slurm")
+    # CASSCF pre chain
     graph.add_edge("read_fchk", "select_orbitals")
-    graph.add_edge("select_orbitals", "generate_slurm")
+    graph.add_edge("select_orbitals", "generate_casscf_input")
+    graph.add_edge("generate_casscf_input", "generate_slurm")
+    # Both converge → slurm → done
     graph.add_edge("generate_slurm", "pre_done")
     graph.add_edge("pre_done", "finalize")
 
+    # Post chain
     graph.add_edge("read_output", "parse_energy")
     graph.add_edge("parse_energy", "register_artifacts")
     graph.add_edge("register_artifacts", "finalize")
@@ -148,7 +125,8 @@ def register() -> AgentRegistration:
         timeout_s=120,
         dependencies=set(),
         description=(
-            "PySCF CASSCF agent. Pre: read fchk → select orbitals → generate script. "
-            "Post: parse CASSCF energy → register orbital info artifact."
+            "PySCF agent. RHF/DFT: generate script → slurm. "
+            "CASSCF: read fchk → orbitals → script → slurm. "
+            "Post: parse energy → register artifacts."
         ),
     )

@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 
 from contracts.agent_task import (
-    AgentTask, AgentResult, ArtifactRef, TaskStatus, AgentName,
+    AgentTask, AgentResult, ArtifactRef, TaskStatus,
 )
 from contracts.gaussian_task import GaussianParams
 from contracts.pyscf_task import PySCFParams
@@ -65,21 +65,35 @@ class SupervisorState(BaseModel):
 def plan_node(state: SupervisorState) -> dict:
     """Decompose user task into ordered agent plan.
 
+    For computation tasks: the chain includes pre-computation → HPC → monitor
+    → post-computation. The same domain agent appears twice (pre + post).
+
     MVP: heuristic keyword matching. Post-MVP: LLM-based decomposition.
     """
     task_lower = state.task.lower()
 
     plan = []
-    if any(kw in task_lower for kw in ["nevpt2", "casscf", "coupled cluster", "ccsd"]):
-        plan = ["gaussian", "pyscf", "orca"]
-    elif any(kw in task_lower for kw in ["opt", "optimization", "hf", "dft"]):
-        plan = ["gaussian"]
+    if any(kw in task_lower for kw in ["nevpt2", "coupled cluster", "ccsd"]):
+        # Full chain: gaussian → pyscf → orca, each with HPC+monitor
+        plan = ["gaussian", "hpc", "monitor", "gaussian",
+                "pyscf", "hpc", "monitor", "pyscf",
+                "orca", "hpc", "monitor", "orca"]
+    elif any(kw in task_lower for kw in ["casscf"]):
+        # CASSCF: pyscf only (reads gaussian fchk if provided)
+        plan = ["pyscf", "hpc", "monitor", "pyscf"]
+    elif any(kw in task_lower for kw in ["rhf", "uhf", "dft", "hf", "scf"]):
+        # Single-software computation: pre → hpc → monitor → post
+        # Detect which software from task
+        if any(kw in task_lower for kw in ["pyscf", "python"]):
+            plan = ["pyscf", "hpc", "monitor", "pyscf"]
+        elif any(kw in task_lower for kw in ["orca"]):
+            plan = ["orca", "hpc", "monitor", "orca"]
+        else:
+            plan = ["gaussian", "hpc", "monitor", "gaussian"]
+    elif any(kw in task_lower for kw in ["opt", "optimization"]):
+        plan = ["gaussian", "hpc", "monitor", "gaussian"]
     else:
-        plan = ["gaussian"]
-
-    # HPC runs in parallel after last chemical agent
-    if any(kw in task_lower for kw in ["hpc", "slurm", "submit", "cluster"]):
-        plan.append("hpc")
+        plan = ["pyscf", "hpc", "monitor", "pyscf"]
 
     return {
         "plan": plan,
@@ -242,25 +256,109 @@ supervisor_graph = build_supervisor_graph().compile()
 # ═══════════════════════════════════════════════════════════════════
 
 def _build_params(agent_name: str, state: SupervisorState) -> Any:
-    """Build agent-specific params. MVP: defaults. Domain devs customize."""
+    """Build agent-specific params from task context + previous agent results.
+
+    Domain agents get computation params (method, basis, etc.).
+    HPC gets job requests derived from previous agent's slurm artifacts.
+    Monitor gets watchlist from HPC's job_ids.
+    """
+    task_lower = state.task.lower()
+
     if agent_name == "gaussian":
         return GaussianParams(method="B3LYP", basis="def2SVP")
     elif agent_name == "pyscf":
-        return PySCFParams(n_active_electrons=6, n_active_orbitals=6)
+        if any(kw in task_lower for kw in ["casscf", "active space"]):
+            return PySCFParams(job_type="CASSCF", n_active_electrons=6,
+                               n_active_orbitals=6)
+        elif any(kw in task_lower for kw in ["dft", "b3lyp", "pbe"]):
+            functional = "b3lyp" if "b3lyp" in task_lower else ""
+            return PySCFParams(job_type="RDFT", functional=functional)
+        elif any(kw in task_lower for kw in ["uhf"]):
+            return PySCFParams(job_type="UHF")
+        else:
+            return PySCFParams(job_type="RHF")
     elif agent_name == "orca":
         return OrcaParams()
+    elif agent_name == "hpc":
+        return _build_hpc_params(state)
+    elif agent_name == "monitor":
+        return _build_monitor_params(state)
     return {}
 
 
+def _build_hpc_params(state: SupervisorState) -> dict:
+    """Build HPCParams from previous agent's slurm artifacts."""
+    from contracts.hpc_task import HPCParams, JobRequest
+
+    jobs = []
+    for a in state.pending_artifacts:
+        if a.get("type") == "slurm":
+            # Extract agent name from artifact_id: "task_id-slurm" → previous agent
+            prev_agent = _guess_agent_from_artifact(a.get("artifact_id", ""))
+            jobs.append(JobRequest(
+                agent=prev_agent,
+                input_file_artifact_id="",  # resolved at runtime
+                rough_slurm_artifact_id=a.get("artifact_id", ""),
+                mem_per_cpu_mb=8000,
+                nprocs=8,
+                walltime_hours=24,
+            ))
+
+    if not jobs:
+        # Fallback: create a default job for the previous domain agent
+        prev_agent = _last_domain_agent(state)
+        if prev_agent:
+            jobs.append(JobRequest(
+                agent=prev_agent,
+                rough_slurm_artifact_id="pending",
+                mem_per_cpu_mb=8000, nprocs=8, walltime_hours=24,
+            ))
+
+    return HPCParams(jobs=jobs, partition="compute")
+
+
+def _build_monitor_params(state: SupervisorState) -> dict:
+    """Build MonitorParams from HPC agent's job_ids.
+
+    HPC returns {agent_name: job_id}. Monitor needs {job_id: agent_name}.
+    """
+    from contracts.monitor_task import MonitorParams
+
+    watchlist = {}
+    for name, result in state.agent_results.items():
+        if name == "hpc" and result is not None:
+            if hasattr(result, "data") and result.data:
+                hpc_data = result.data
+                if hasattr(hpc_data, "job_ids"):
+                    # Invert: {"pyscf": "12345"} → {"12345": "pyscf"}
+                    watchlist = {v: k for k, v in hpc_data.job_ids.items()}
+                    break
+
+    return MonitorParams(watchlist=watchlist, poll_interval_s=5)
+
+
+def _last_domain_agent(state: SupervisorState) -> str:
+    """Find the most recent domain agent from the plan."""
+    for name in reversed(state.plan[:state.current_plan_index]):
+        if name in ("gaussian", "pyscf", "orca"):
+            return name
+    return ""
+
+
+def _guess_agent_from_artifact(artifact_id: str) -> str:
+    """Guess agent name from artifact_id pattern."""
+    for agent in ["gaussian", "pyscf", "orca"]:
+        if agent in artifact_id.lower():
+            return agent
+    return "pyscf"
+
+
 def _goal_for(agent_name: str, task: str) -> str:
-    goals = {
-        "gaussian": f"HF optimization for: {task}",
-        "pyscf": f"Orbital selection + CASSCF for: {task}",
-        "orca": f"NEVPT2 computation for: {task}",
-        "hpc": f"Slurm generation + job submission for: {task}",
-        "monitor": f"Monitor jobs for: {task}",
-    }
-    return goals.get(agent_name, task)
+    if agent_name == "hpc":
+        return f"Generate Slurm and submit jobs for: {task}"
+    if agent_name == "monitor":
+        return f"Monitor submitted jobs for: {task}"
+    return f"Compute: {task}"
 
 
 def _summarize_data(data) -> str:
