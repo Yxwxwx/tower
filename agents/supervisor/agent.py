@@ -1,16 +1,17 @@
-"""Supervisor agent — actually dispatches to sub-agents and collects results.
+"""Supervisor agent — dispatches to sub-agents with retry/backtrack support.
 
 Topology:
     START → plan → dispatch_agent → [agent executes] → collect_result
            ↑                                          ↓
            └────────── next agent ←──── route ─────────┘
-                                                      ↓
+           ↑  (backtrack on RETRYING)                  ↓
                                                   synthesize → END
 """
 from typing import Any, Literal
 
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
+from rich.console import Console
 
 from contracts.agent_task import (
     AgentTask, AgentResult, ArtifactRef, TaskStatus,
@@ -19,6 +20,8 @@ from contracts.gaussian_task import GaussianParams
 from contracts.pyscf_task import PySCFParams
 from contracts.orca_task import OrcaParams
 from tower_agent_kit.base import AgentRegistration, RetryPolicy
+
+console = Console()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -140,78 +143,81 @@ def _keyword_plan(task: str) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════
 
 def dispatch_agent(state: SupervisorState) -> dict:
-    """Invoke the current agent's subgraph with the right AgentTask.
-
-    Builds AgentTask with artifacts_in from the previous agent's output.
-    Stores the AgentResult in state.agent_results.
-    """
+    """Invoke the current agent's subgraph and handle retry/backtrack."""
     idx = state.current_plan_index
     agent_name = state.plan[idx]
+
+    # Progress output
+    labels = {"pyscf": "[bold green]PySCF[/]", "gaussian": "[bold green]Gaussian[/]",
+              "orca": "[bold green]Orca[/]", "hpc": "[bold magenta]HPC[/]",
+              "monitor": "[bold magenta]Monitor[/]", "supervisor": "[bold cyan]Supervisor[/]"}
+    label = labels.get(agent_name, agent_name)
+    console.print(f"  {label} [dim]agent running...[/]")
 
     subgraph = _agent_subgraphs.get(agent_name)
     if subgraph is None:
         return {
-            "agent_results": {
-                **state.agent_results,
-                agent_name: AgentResult(
-                    task_id=f"{state.run_id}-{agent_name}",
-                    trace_id=state.trace_id,
-                    status=TaskStatus.FAILED,
+            "agent_results": {**state.agent_results,
+                agent_name: AgentResult(task_id=f"{state.run_id}-{agent_name}",
+                    trace_id=state.trace_id, status=TaskStatus.FAILED,
                     agent=agent_name,
-                    errors=[f"Agent '{agent_name}' not found in registry"],
-                ),
-            },
+                    errors=[f"Agent '{agent_name}' not found in registry"])},
             "current_plan_index": idx + 1,
         }
 
-    # Build AgentTask with upstream artifacts
+    # Build AgentTask
     artifacts_in = [
-        ArtifactRef(
-            artifact_id=a["artifact_id"],
-            type=a.get("type", ""),
-            description=a.get("description", ""),
-        )
+        ArtifactRef(artifact_id=a["artifact_id"], type=a.get("type", ""),
+                    description=a.get("description", ""))
         for a in state.pending_artifacts
     ]
-
     params = _build_params(agent_name, state)
     task = AgentTask(
-        task_id=f"{state.run_id}-{agent_name}",
-        trace_id=state.trace_id,
-        parent_run_id=state.run_id,
-        goal=_goal_for(agent_name, state.task),
-        agent=agent_name,
-        params=params,
-        artifacts_in=artifacts_in,
+        task_id=f"{state.run_id}-{agent_name}", trace_id=state.trace_id,
+        parent_run_id=state.run_id, goal=_goal_for(agent_name, state.task),
+        agent=agent_name, params=params, artifacts_in=artifacts_in,
     )
 
-    # === INVOKE THE AGENT ===
-    agent_state = {
-        "task": task,
-        "task_id": task.task_id,
-        "trace_id": state.trace_id,
-        "status": TaskStatus.PENDING,
-    }
-    result_state = subgraph.invoke(agent_state)
+    # === INVOKE ===
+    result_state = subgraph.invoke({
+        "task": task, "task_id": task.task_id,
+        "trace_id": state.trace_id, "status": TaskStatus.PENDING,
+    })
     agent_result = result_state.get("agent_result")
-    # =========================
 
-    # Pass artifacts from this agent to the next one
+    # Collect output artifacts
     new_artifacts = []
     if agent_result and agent_result.artifacts_out:
         new_artifacts = [
-            {
-                "artifact_id": a.artifact_id,
-                "type": a.type,
-                "description": a.description or "",
-            }
-            for a in agent_result.artifacts_out
-            if a.artifact_id
+            {"artifact_id": a.artifact_id, "type": a.type,
+             "description": a.description or ""}
+            for a in agent_result.artifacts_out if a.artifact_id
         ]
+
+    # Retry logic: if domain agent needs retry, backtrack to HPC
+    next_idx = idx + 1
+    agent_status = agent_result.status if agent_result else TaskStatus.DONE
+
+    if agent_status == TaskStatus.RETRYING:
+        console.print(f"  {label} [yellow]retrying...[/]")
+        # Backtrack: find previous HPC in the plan
+        prev_hpc = max((i for i, n in enumerate(state.plan[:idx])
+                        if n == "hpc"), default=-1)
+        if prev_hpc >= 0:
+            next_idx = prev_hpc
+        else:
+            next_idx = idx  # re-run same agent
+    elif agent_status == TaskStatus.NEEDS_HUMAN:
+        console.print(f"  {label} [red]needs human intervention[/]")
+
+    extra = {}
+    if agent_status == TaskStatus.NEEDS_HUMAN:
+        extra["needs_human"] = True
 
     return {
         "agent_results": {**state.agent_results, agent_name: agent_result},
-        "current_plan_index": idx + 1,
+        "current_plan_index": next_idx,
+        **extra,
         "pending_artifacts": new_artifacts,
         "needs_human": (
             agent_result is not None and agent_result.status == TaskStatus.NEEDS_HUMAN
