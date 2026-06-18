@@ -198,8 +198,13 @@ def _render_agent_result(agent_name: str, status: str, data=None, errors=None):
 
     lines = [f"[{color}]{icon} {status.upper()}[/] "]
 
-    if data and hasattr(data, "energy") and data.energy is not None:
-        lines.append(f"[dim]E = {data.energy:.6f} Ha[/]")
+    if data and hasattr(data, "energy") and data.energy:
+        if isinstance(data.energy, dict):
+            for label, val in data.energy.items():
+                if isinstance(val, (int, float)):
+                    lines.append(f"[dim]E({label}) = {val:.6f} Ha[/]")
+        elif isinstance(data.energy, (int, float)):
+            lines.append(f"[dim]E = {data.energy:.6f} Ha[/]")
     if data and hasattr(data, "converged") and data.converged:
         lines.append("[green]converged[/]")
     if data and hasattr(data, "wall_time_s") and data.wall_time_s > 0:
@@ -254,11 +259,15 @@ def cli(ctx):
         console.print()
         console.print("[dim]Commands:[/]")
         console.print(
+            "  [bold]tower chat[/]             Start interactive AI chat (Claude Code style)"
+        )
+        console.print(
             "  [bold]tower run[/] <task>     Execute a computational chemistry task"
         )
         console.print("  [bold]tower agents[/]           List all registered agents")
         console.print()
         console.print("[dim]Examples:[/]")
+        console.print("  [dim]$[/] tower chat")
         console.print('  [dim]$[/] tower run "N2 NEVPT2 calculation"')
         console.print('  [dim]$[/] tower run "H4 chain DMRG with M=200"')
         console.print("  [dim]$[/] tower agents")
@@ -331,6 +340,16 @@ def run(task: str, run_id: Optional[str]):
         _render_final_result(result.get("final_response", ""), plan)
 
     asyncio.run(_run())
+
+
+@cli.command()
+def chat():
+    """Start an interactive AI chat session (like Claude Code REPL)."""
+    _print_banner()
+
+    from tower.chat import run_chat
+
+    asyncio.run(run_chat())
 
 
 @cli.command()

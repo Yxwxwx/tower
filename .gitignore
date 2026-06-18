@@ -14,9 +14,10 @@ wheels/
 .tower/
 
 # Archived old code (single-agent implementation)
-.old_tower/
+*.old_tower/
 
 .claude
 .env
 
 test_dir/
+jobs/

@@ -63,43 +63,76 @@ class SupervisorState(BaseModel):
 # ═══════════════════════════════════════════════════════════════════
 
 def plan_node(state: SupervisorState) -> dict:
-    """Decompose user task into ordered agent plan.
+    """Decompose user task into ordered agent plan using LLM.
 
-    For computation tasks: the chain includes pre-computation → HPC → monitor
-    → post-computation. The same domain agent appears twice (pre + post).
-
-    MVP: heuristic keyword matching. Post-MVP: LLM-based decomposition.
+    Falls back to keyword heuristics if LLM parsing fails.
     """
-    task_lower = state.task.lower()
-
-    plan = []
-    if any(kw in task_lower for kw in ["nevpt2", "coupled cluster", "ccsd"]):
-        # Full chain: gaussian → pyscf → orca, each with HPC+monitor
-        plan = ["gaussian", "hpc", "monitor", "gaussian",
-                "pyscf", "hpc", "monitor", "pyscf",
-                "orca", "hpc", "monitor", "orca"]
-    elif any(kw in task_lower for kw in ["casscf"]):
-        # CASSCF: pyscf only (reads gaussian fchk if provided)
-        plan = ["pyscf", "hpc", "monitor", "pyscf"]
-    elif any(kw in task_lower for kw in ["rhf", "uhf", "dft", "hf", "scf"]):
-        # Single-software computation: pre → hpc → monitor → post
-        # Detect which software from task
-        if any(kw in task_lower for kw in ["pyscf", "python"]):
-            plan = ["pyscf", "hpc", "monitor", "pyscf"]
-        elif any(kw in task_lower for kw in ["orca"]):
-            plan = ["orca", "hpc", "monitor", "orca"]
-        else:
-            plan = ["gaussian", "hpc", "monitor", "gaussian"]
-    elif any(kw in task_lower for kw in ["opt", "optimization"]):
-        plan = ["gaussian", "hpc", "monitor", "gaussian"]
-    else:
-        plan = ["pyscf", "hpc", "monitor", "pyscf"]
-
+    plan = _llm_plan(state.task)
     return {
         "plan": plan,
         "current_plan_index": 0,
         "task_complete": len(plan) == 0,
     }
+
+
+def _llm_plan(task: str) -> list[str]:
+    """Use LLM to decompose the task, with fallback to heuristics."""
+    import json
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from tower.llm import get_model
+    from agents.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT, PLAN_JSON_SCHEMA
+
+    prompt = (
+        f"{SUPERVISOR_SYSTEM_PROMPT}\n\n"
+        f"Example output: {PLAN_JSON_SCHEMA}\n\n"
+        f"Task: {task}"
+    )
+
+    try:
+        model = get_model(temperature=0.0)
+        response = model.invoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content=f"Plan the workflow for: {task}"),
+        ])
+
+        # Extract JSON from response (may have markdown fences)
+        text = response.content.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+        data = json.loads(text)
+        plan = data.get("plan", [])
+        if plan:
+            return plan
+    except Exception:
+        pass
+
+    # Fallback: keyword heuristics
+    return _keyword_plan(task)
+
+
+def _keyword_plan(task: str) -> list[str]:
+    """Keyword-based fallback planner."""
+    task_lower = task.lower()
+
+    if any(kw in task_lower for kw in ["nevpt2", "coupled cluster", "ccsd"]):
+        return ["gaussian", "hpc", "monitor", "gaussian",
+                "pyscf", "hpc", "monitor", "pyscf",
+                "orca", "hpc", "monitor", "orca"]
+    elif any(kw in task_lower for kw in ["casscf"]):
+        return ["pyscf", "hpc", "monitor", "pyscf"]
+    elif any(kw in task_lower for kw in ["rhf", "uhf", "dft", "hf", "scf"]):
+        if any(kw in task_lower for kw in ["pyscf", "python"]):
+            return ["pyscf", "hpc", "monitor", "pyscf"]
+        elif any(kw in task_lower for kw in ["orca"]):
+            return ["orca", "hpc", "monitor", "orca"]
+        else:
+            return ["gaussian", "hpc", "monitor", "gaussian"]
+    elif any(kw in task_lower for kw in ["opt", "optimization"]):
+        return ["gaussian", "hpc", "monitor", "gaussian"]
+    else:
+        return ["pyscf", "hpc", "monitor", "pyscf"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -163,7 +196,11 @@ def dispatch_agent(state: SupervisorState) -> dict:
     new_artifacts = []
     if agent_result and agent_result.artifacts_out:
         new_artifacts = [
-            {"artifact_id": a.artifact_id, "type": a.type}
+            {
+                "artifact_id": a.artifact_id,
+                "type": a.type,
+                "description": a.description or "",
+            }
             for a in agent_result.artifacts_out
             if a.artifact_id
         ]
@@ -267,16 +304,11 @@ def _build_params(agent_name: str, state: SupervisorState) -> Any:
     if agent_name == "gaussian":
         return GaussianParams(method="B3LYP", basis="def2SVP")
     elif agent_name == "pyscf":
-        if any(kw in task_lower for kw in ["casscf", "active space"]):
-            return PySCFParams(job_type="CASSCF", n_active_electrons=6,
-                               n_active_orbitals=6)
-        elif any(kw in task_lower for kw in ["dft", "b3lyp", "pbe"]):
-            functional = "b3lyp" if "b3lyp" in task_lower else ""
-            return PySCFParams(job_type="RDFT", functional=functional)
-        elif any(kw in task_lower for kw in ["uhf"]):
-            return PySCFParams(job_type="UHF")
-        else:
-            return PySCFParams(job_type="RHF")
+        return PySCFParams(
+            task_description=state.task,
+            charge=0,
+            spin=0,
+        )
     elif agent_name == "orca":
         return OrcaParams()
     elif agent_name == "hpc":
@@ -287,34 +319,59 @@ def _build_params(agent_name: str, state: SupervisorState) -> Any:
 
 
 def _build_hpc_params(state: SupervisorState) -> dict:
-    """Build HPCParams from previous agent's slurm artifacts."""
+    """Build HPCParams from previous agent's artifacts, including resources."""
+    import json
     from contracts.hpc_task import HPCParams, JobRequest
 
     jobs = []
+    prev_agent = _last_domain_agent(state)
+
+    # Extract resources and run_command from pending artifacts
+    resources = {}
+    run_command = ""
+    run_command_id = ""
+    slurm_id = ""
+    script_id = ""
+
     for a in state.pending_artifacts:
-        if a.get("type") == "slurm":
-            # Extract agent name from artifact_id: "task_id-slurm" → previous agent
-            prev_agent = _guess_agent_from_artifact(a.get("artifact_id", ""))
-            jobs.append(JobRequest(
-                agent=prev_agent,
-                input_file_artifact_id="",  # resolved at runtime
-                rough_slurm_artifact_id=a.get("artifact_id", ""),
-                mem_per_cpu_mb=8000,
-                nprocs=8,
-                walltime_hours=24,
-            ))
+        a_type = a.get("type", "")
+        a_id = a.get("artifact_id", "")
+        a_desc = a.get("description", "")
+
+        if a_type == "json" and a_id.endswith("-resources"):
+            try:
+                resources = json.loads(a_desc) if a_desc else {}
+            except Exception:
+                pass
+        elif a_type == "json" and a_id.endswith("-run"):
+            run_command_id = a_id
+            # run_command is stored in the description field of the run artifact
+            if a_desc:
+                run_command = a_desc
+        elif a_type == "slurm":
+            slurm_id = a_id
+        elif a_type in ("gjf", "inp"):
+            script_id = a_id
+
+    if prev_agent and (slurm_id or run_command_id or script_id):
+        jobs.append(JobRequest(
+            agent=prev_agent,
+            input_file_artifact_id=script_id,
+            rough_slurm_artifact_id=slurm_id,
+            run_command_artifact_id=run_command_id,
+            resources=resources,
+        ))
 
     if not jobs:
-        # Fallback: create a default job for the previous domain agent
         prev_agent = _last_domain_agent(state)
         if prev_agent:
             jobs.append(JobRequest(
                 agent=prev_agent,
                 rough_slurm_artifact_id="pending",
-                mem_per_cpu_mb=8000, nprocs=8, walltime_hours=24,
+                resources={"omp_threads": 8, "memory_mb": 8000, "walltime_hours": 24},
             ))
 
-    return HPCParams(jobs=jobs, partition="compute")
+    return HPCParams(jobs=jobs, run_command=run_command, partition="compute")
 
 
 def _build_monitor_params(state: SupervisorState) -> dict:
@@ -363,10 +420,13 @@ def _goal_for(agent_name: str, task: str) -> str:
 
 def _summarize_data(data) -> str:
     """Brief summary of agent result data."""
-    if hasattr(data, "energy") and data.energy is not None:
-        return f"E = {data.energy:.6f} Ha"
-    if hasattr(data, "casscf_energy") and data.casscf_energy is not None:
-        return f"E(CASSCF) = {data.casscf_energy:.6f} Ha"
+    if hasattr(data, "energy") and data.energy:
+        if isinstance(data.energy, dict):
+            parts = [f"E({k}) = {v:.6f} Ha" for k, v in data.energy.items()
+                     if isinstance(v, (int, float))]
+            return ", ".join(parts) if parts else ""
+        elif isinstance(data.energy, (int, float)):
+            return f"E = {data.energy:.6f} Ha"
     return ""
 
 
