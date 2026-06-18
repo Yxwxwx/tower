@@ -14,7 +14,7 @@ class MonitorParams(BaseModel):
     watchlist: dict[str, str] = Field(default_factory=dict)
     # {"232164": "pyscf"} — job_id → agent_name
     run_dir: str = ""                              # shared job directory
-    log_path: str = "pyscf.log"                    # relative to run_dir
+    log_path: str = ""                              # relative to run_dir, set by supervisor
     poll_interval_s: int = 10
     max_wait_s: int = 86400                        # 24h default
 

@@ -12,6 +12,7 @@ from typing import Any, Literal
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 from rich.console import Console
+from rich.text import Text
 
 from contracts.agent_task import (
     AgentTask, AgentResult, ArtifactRef, TaskStatus,
@@ -147,12 +148,10 @@ def dispatch_agent(state: SupervisorState) -> dict:
     idx = state.current_plan_index
     agent_name = state.plan[idx]
 
-    # Progress output
-    labels = {"pyscf": "[bold green]PySCF[/]", "gaussian": "[bold green]Gaussian[/]",
-              "orca": "[bold green]Orca[/]", "hpc": "[bold magenta]HPC[/]",
-              "monitor": "[bold magenta]Monitor[/]", "supervisor": "[bold cyan]Supervisor[/]"}
-    label = labels.get(agent_name, agent_name)
-    console.print(f"  {label} [dim]agent running...[/]")
+    # Progress output with spinner
+    labels = {"pyscf": "green", "gaussian": "green", "orca": "green",
+              "hpc": "magenta", "monitor": "magenta", "supervisor": "cyan"}
+    color = labels.get(agent_name, "white")
 
     subgraph = _agent_subgraphs.get(agent_name)
     if subgraph is None:
@@ -178,11 +177,22 @@ def dispatch_agent(state: SupervisorState) -> dict:
         agent=agent_name, params=params, artifacts_in=artifacts_in,
     )
 
-    # === INVOKE ===
-    result_state = subgraph.invoke({
-        "task": task, "task_id": task.task_id,
-        "trace_id": state.trace_id, "status": TaskStatus.PENDING,
-    })
+    # === INVOKE with spinner (non-transient) ===
+    from rich.live import Live
+    from rich.spinner import Spinner
+    spinner = Spinner("dots", text=Text.assemble(
+        (agent_name.upper(), f"bold {color}"), (" running...", "dim"),
+    ))
+    with Live(spinner, refresh_per_second=10, transient=False) as live:
+        result_state = subgraph.invoke({
+            "task": task, "task_id": task.task_id,
+            "trace_id": state.trace_id, "status": TaskStatus.PENDING,
+        })
+        live.update(Text.assemble(
+            ("  ✔ ", "green"),
+            (agent_name.upper(), f"bold {color}"),
+            (" done", "green"),
+        ))
     agent_result = result_state.get("agent_result")
 
     # Collect output artifacts
@@ -199,7 +209,7 @@ def dispatch_agent(state: SupervisorState) -> dict:
     agent_status = agent_result.status if agent_result else TaskStatus.DONE
 
     if agent_status == TaskStatus.RETRYING:
-        console.print(f"  {label} [yellow]retrying...[/]")
+        console.print(f"  [{color}]{agent_name}[/] [yellow]retrying...[/]")
         # Backtrack: find previous HPC in the plan
         prev_hpc = max((i for i, n in enumerate(state.plan[:idx])
                         if n == "hpc"), default=-1)
@@ -208,7 +218,7 @@ def dispatch_agent(state: SupervisorState) -> dict:
         else:
             next_idx = idx  # re-run same agent
     elif agent_status == TaskStatus.NEEDS_HUMAN:
-        console.print(f"  {label} [red]needs human intervention[/]")
+        console.print(f"  [{color}]{agent_name}[/] [red]needs human intervention[/]")
 
     extra = {}
     if agent_status == TaskStatus.NEEDS_HUMAN:
@@ -401,9 +411,16 @@ def _build_monitor_params(state: SupervisorState) -> dict:
                     watchlist = {v: k for k, v in hpc_data.job_ids.items()}
                     break
 
+    # Determine log filename from the domain agent's task_id
+    log_path = ""
+    prev_agent = _last_domain_agent(state)
+    if prev_agent:
+        log_path = f"{state.run_id}-{prev_agent}.log"
+
     return MonitorParams(
         watchlist=watchlist,
         run_dir=state.run_id,
+        log_path=log_path,
         poll_interval_s=10,
         max_wait_s=86400,
     )

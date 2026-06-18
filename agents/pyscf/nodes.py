@@ -63,7 +63,7 @@ def generate_input(state) -> dict:
     task_id = state.task_id
     run_dir = task_id.rsplit("-", 1)[0] if "-" in task_id else task_id
     script_path = f"{run_dir}/{task_id}.py"
-    log_path = f"{run_dir}/pyscf.log"
+    log_path = f"{run_dir}/{task_id}.log"
 
     prompt = PYSCF_GENERATE_PROMPT.format(
         task_description=params.task_description or task.goal,
@@ -71,7 +71,7 @@ def generate_input(state) -> dict:
         spin=params.spin,
         fchk_artifact_id=params.fchk_artifact_id or "none",
         script_path=f"{task_id}.py",
-        log_path="pyscf.log",
+        log_path=f"{task_id}.log",
     )
 
     try:
@@ -94,7 +94,7 @@ def generate_input(state) -> dict:
         resources = {}
 
     if not run_command:
-        run_command = f"python -u {task_id}.py > pyscf.log 2>&1"
+        run_command = f"python -u {task_id}.py > {task_id}.log 2>&1"
 
     return {
         "node_history": state.node_history + ["generate_input"],
@@ -176,7 +176,7 @@ module purge
 
 export OMP_NUM_THREADS={omp}
 
-cd {run_dir} && {sp.get('run_command', f'python -u {task_id}.py > pyscf.log 2>&1')}
+cd {run_dir} && {sp.get('run_command', f'python -u {task_id}.py > {task_id}.log 2>&1')}
 """
 
     return {
@@ -201,8 +201,10 @@ def pre_done(state) -> dict:
         Path(py_path).parent.mkdir(parents=True, exist_ok=True)
         Path(py_path).write_text(sp["py_script"])
 
+    # Preserve RETRYING status from fix_input, default to DONE
+    status = state.status if state.status in (TaskStatus.RETRYING, TaskStatus.NEEDS_HUMAN) else TaskStatus.DONE
     return {
-        "status": TaskStatus.DONE,
+        "status": status,
         "artifacts_out": [
             Artifact(
                 artifact_id=f"{task_id}-script",
@@ -397,8 +399,9 @@ def fix_input(state) -> dict:
     # Build prompt
     previous_fixes = json.dumps(sp.get("fix_history", []), indent=2)
     task_id = state.task_id
-    script_path = f"jobs/{task_id}/{task_id}_fix{retries}.py"
-    log_path = f"jobs/{task_id}/pyscf_fix{retries}.log"
+    run_dir = sp.get("run_dir", task_id.rsplit("-", 1)[0] if "-" in task_id else task_id)
+    script_path = f"{run_dir}/{task_id}_fix{retries}.py"
+    log_path = f"{run_dir}/{task_id}_fix{retries}.log"
 
     prompt = PYSCF_FIX_PROMPT.format(
         task_description=params.task_description or state.task.goal,
@@ -406,8 +409,8 @@ def fix_input(state) -> dict:
         log_content=sp.get("log_content", "")[-4000:],
         current_script=sp.get("py_script", ""),
         previous_fixes=previous_fixes,
-        script_path=script_path,
-        log_path=log_path,
+        script_path=f"{task_id}_fix{retries}.py",
+        log_path=f"{task_id}_fix{retries}.log",
     )
 
     try:
@@ -439,7 +442,7 @@ def fix_input(state) -> dict:
 
     run_command = data.get("run_command", "")
     if not run_command:
-        run_command = f"python -u {task_id}.py > pyscf.log 2>&1"
+        run_command = f"python -u {task_id}_fix{retries}.py > {task_id}_fix{retries}.log 2>&1"
 
     return {
         "status": TaskStatus.RETRYING,

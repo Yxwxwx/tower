@@ -252,7 +252,7 @@ def _fallback_slurm(analysis: dict, run_command: str, job_dir: str = "") -> str:
     partition = analysis.get("partition", "compute")
     tmpdir = analysis.get("tmpdir", "")
     module_lines = "\n".join(analysis.get("module_loads", []))
-    out_err = f"\n#SBATCH --output={run_dir}/slurm-%j.out\n#SBATCH --error={run_dir}/slurm-%j.err" if run_dir else ""
+    out_err = ""
     cd_line = f"\ncd {run_dir}" if run_dir else ""
 
     script = f"""#!/bin/bash
@@ -284,8 +284,8 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 {run_command}
 
 """
-    if tmpdir and run_dir:
-        script += f'mkdir -p "{run_dir}/tmp"\ntar cf - -C "$TMPDIR" . | tar xf - -C "{run_dir}/tmp"\nrm -rf "$TMPDIR"\n'
+    if tmpdir:
+        script += 'mkdir -p "tmp"\ntar cf - -C "$TMPDIR" . | tar xf - -C "tmp"\nrm -rf "$TMPDIR"\n'
     elif tmpdir:
         script += """mkdir -p "${PWD}/tmp"
 tar cf - -C "$TMPDIR" . | tar xf - -C "${PWD}/tmp"

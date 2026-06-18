@@ -31,8 +31,6 @@ Generate a complete Slurm script following this exact pattern:
 #SBATCH --partition={partition}
 #SBATCH --mem=MEMG
 #SBATCH --no-requeue
-#SBATCH --output={job_dir}/slurm-%j.out
-#SBATCH --error={job_dir}/slurm-%j.err
 
 TMPDIR={tmpdir}
 if [ -d $TMPDIR ]; then
@@ -53,8 +51,8 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 cd {job_dir}
 {run_command}
 
-mkdir -p "{job_dir}/tmp"
-tar cf - -C "$TMPDIR" . | tar xf - -C "{job_dir}/tmp"
+mkdir -p "tmp"
+tar cf - -C "$TMPDIR" . | tar xf - -C "tmp"
 rm -rf "$TMPDIR"
 ```
 

@@ -159,20 +159,37 @@ def read_logs(state: MonitorState) -> dict:
     sp = state.scratchpad if hasattr(state, "scratchpad") and isinstance(state.scratchpad, dict) else {}
     params = state.task.params if state.task else MonitorParams()
     run_dir = getattr(params, "run_dir", "")
-    log_path = getattr(params, "log_path", "pyscf.log") or "pyscf.log"
+    log_path = getattr(params, "log_path", "") or ""
+    # Fallback: find any .log file in run_dir
+    if run_dir and not log_path:
+        rd = Path(run_dir)
+        if rd.exists():
+            logs = sorted(rd.glob("*.log"))
+            if logs:
+                log_path = logs[0].name
 
     log_content = ""
-    if run_dir:
+    error_content = ""
+    if run_dir and log_path:
         f = Path(run_dir) / log_path
         if f.exists():
             log_content = f.read_text()
             console.print(f"  [dim]Read log: {f} ({len(log_content)} chars)[/]")
         else:
             console.print(f"  [yellow]Log not found: {f}[/]")
+        # Slurm output lands in $PWD (submission dir) by default
+        for jid in sp.get("job_states", {}):
+            for suffix in [".out", ".err"]:
+                sf = Path(f"slurm-{jid}{suffix}")
+                if sf.exists():
+                    txt = sf.read_text()
+                    if txt.strip():
+                        error_content += f"[slurm-{jid}{suffix}]\n{txt[-3000:]}\n"
+                        console.print(f"  [dim]Read: {sf} ({len(txt)} chars)[/]")
 
     return {
         "node_history": _node_history(state, "read_logs"),
-        "scratchpad": {**sp, "log_content": log_content},
+        "scratchpad": {**sp, "log_content": log_content, "error_content": error_content},
     }
 
 
@@ -194,19 +211,25 @@ def post_done(state: MonitorState) -> dict:
     completed = [e.job_id for e in events if e.event_type == "JOB_DONE"]
     failed = [e.job_id for e in events if e.event_type == "JOB_FAILED"]
 
+    # Combine log + error for downstream agent
+    full_content = log_content
+    error_content = sp.get("error_content", "")
+    if error_content:
+        full_content = f"=== COMPUTATION LOG ===\n{log_content}\n\n=== SLURM OUTPUT ===\n{error_content}"
+
     result = MonitorResult(
         events=events,
         completed_jobs=completed,
         failed_jobs=failed,
-        log_content=log_content,
-        summary=f"{len(completed)} done, {len(failed)} failed · {len(log_content)} chars log",
+        log_content=full_content,
+        summary=f"{len(completed)} done, {len(failed)} failed · {len(full_content)} chars",
     )
 
     artifacts = []
-    if log_content:
+    if full_content:
         artifacts.append(Artifact(
             artifact_id=f"{state.task_id}-log",
-            path=str(Path(getattr(params, 'run_dir', '')) / getattr(params, 'log_path', 'pyscf.log')),
+            path=str(Path(getattr(params, 'run_dir', '')) / (getattr(params, 'log_path', '') or 'output.log')),
             type="log",
             description=log_content,
             producer_agent="monitor",

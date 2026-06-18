@@ -396,8 +396,7 @@ async def _dispatch_run(task: str):
         "trace_id": trace_id,
     }
 
-    with console.status("[bold green]supervisor orchestrating...[/]", spinner="dots"):
-        result = supervisor.subgraph.invoke(initial_state)
+    result = supervisor.subgraph.invoke(initial_state)
 
     plan = result.get("plan", [])
 
@@ -437,7 +436,64 @@ async def _dispatch_run(task: str):
         console.print(Markdown(final))
         console.print()
 
+    # Write Markdown summary
+    _write_summary(run_id, task, plan, agent_results, final)
     console.print(SEP)
+
+
+def _write_summary(run_id: str, task: str, plan: list, agent_results: dict, final: str):
+    """Write a Markdown summary of the computation run."""
+    import time as _time
+    summary_path = Path(f"{run_id}/{run_id}_summary.md")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        f"# Tower Run Summary",
+        f"",
+        f"**Task:** {task}",
+        f"**Run ID:** {run_id}",
+        f"**Date:** {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"**Plan:** {' → '.join(plan)}",
+        f"",
+        f"## Results",
+        f"",
+    ]
+    for name in plan:
+        ar = agent_results.get(name)
+        if ar is None:
+            lines.append(f"- **{name}**: not executed")
+            continue
+        status = ar.status.value if hasattr(ar, "status") else "?"
+        icon = "✅" if status == "done" else "❌"
+        lines.append(f"- {icon} **{name}**: {status}")
+        if hasattr(ar, "data") and ar.data:
+            data = ar.data
+            if hasattr(data, "energy"):
+                for k, v in data.energy.items():
+                    lines.append(f"  - E({k}) = {v:.8f} Ha")
+            if hasattr(data, "converged"):
+                lines.append(f"  - converged: {dict(data.converged)}")
+            if hasattr(data, "extra") and data.extra:
+                extras = data.extra
+                for k in ["homo_energy_ev", "lumo_energy_ev", "wall_time_s", "n_scf_iterations"]:
+                    if k in extras:
+                        lines.append(f"  - {k}: {extras[k]}")
+        if hasattr(ar, "errors") and ar.errors:
+            for e in ar.errors[:3]:
+                lines.append(f"  - ⚠ {e[:120]}")
+        lines.append("")
+
+    if final:
+        lines.append(f"## Final Response")
+        lines.append(f"")
+        lines.append(final)
+        lines.append("")
+
+    content = "\n".join(lines)
+    summary_path.write_text(content)
+    console.print(SEP)
+    console.print(Markdown(content))
+    console.print(f"[dim]Summary saved: {summary_path}[/]")
 
 
 # ═══════════════════════════════════════════════════════════════════
