@@ -21,7 +21,7 @@ Calculation log:
 
 6. TIMING: Extract wall time and CPU time in seconds. Extract number of SCF iterations.
 
-7. PROPERTIES: Extract dipole moment (vector components + total magnitude, Debye), Mulliken charges, natural orbital occupations (for CASSCF), oscillator strengths (for TD-DFT).
+7. PROPERTIES: Extract natural orbital occupations (for CASSCF), oscillator strengths (for TD-DFT).
 
 8. ERRORS: If the log contains error messages, include them in extra.errors as an array of strings. Include relevant traceback lines.
 
@@ -46,8 +46,6 @@ Return ONLY a JSON object. No markdown fences. No explanation.
     "homo_energy_ev": -15.63,
     "lumo_energy_ev": 2.14,
     "homo_lumo_gap_ev": 17.77,
-    "dipole_vector_debye": [0.0, 0.0, 0.001],
-    "dipole_magnitude_debye": 0.001,
     "wall_time_s": 3.245,
     "cpu_time_s": 2.987,
     "n_scf_iterations": 8,

@@ -135,9 +135,7 @@ Frequency analysis:
 - "thermo_free_energy": float (Hartree)
 
 Properties:
-- "dipole_vector": [float, float, float] (Debye)
-- "dipole_magnitude": float (Debye)
-- "mulliken_charges": [float, ...]
+-
 
 Timing:
 - "wall_time_s": float
@@ -156,7 +154,7 @@ Return ONLY a JSON object. No markdown fences. No explanation text. The fields:
     "charge": 0,
     "spin": 0
   }},
-  "expected_outputs": ["scf_energy", "scf_converged", "homo_energy", "lumo_energy", "homo_lumo_gap", "dipole_magnitude", "wall_time_s"],
+  "expected_outputs": ["scf_energy", "scf_converged", "homo_energy", "lumo_energy", "homo_lumo_gap", "wall_time_s"],
   "run_command": "python -u {script_path} > {log_path} 2>&1",
   "resources": {{
     "omp_threads": 8,

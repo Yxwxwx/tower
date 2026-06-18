@@ -1,29 +1,33 @@
-"""Monitor agent contract — frozen v1.0."""
+"""Monitor agent contract — v1.1.
+
+Real Slurm job polling via sacct/squeue, log reading, and result delivery.
+"""
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
-
 from contracts.agent_task import AgentName
 
 
 class MonitorParams(BaseModel):
-    """Supervisor → MonitorAgent."""
+    """Supervisor → Monitor agent."""
     watchlist: dict[str, str] = Field(default_factory=dict)
-    # {"12345": "gaussian", "12346": "orca"}
-    poll_interval_s: int = 60
-    max_watch_hours: int = 48
+    # {"232164": "pyscf"} — job_id → agent_name
+    run_dir: str = ""                              # shared job directory
+    log_path: str = "pyscf.log"                    # relative to run_dir
+    poll_interval_s: int = 10
+    max_wait_s: int = 86400                        # 24h default
 
 
 class MonitorEvent(BaseModel):
-    """MonitorAgent writes these to RunStateStore.event_log (append-only)."""
-    id: int = 0                              # monotonic, set by event_log
+    """Monitor writes these to state.event_log."""
+    id: int = 0
     job_id: str = ""
     agent: AgentName = "supervisor"
     timestamp: datetime = Field(default_factory=datetime.now)
     event_type: Literal[
-        "JOB_STARTED", "JOB_DONE", "JOB_FAILED",
-        "JOB_TIMEOUT", "JOB_OOM", "AGENT_HEARTBEAT_LOST",
+        "JOB_STARTED", "JOB_RUNNING", "JOB_DONE",
+        "JOB_FAILED", "JOB_TIMEOUT", "JOB_OOM",
     ] = "JOB_STARTED"
     log_snippet: str = ""
     error_category: Literal[
@@ -34,8 +38,9 @@ class MonitorEvent(BaseModel):
 
 
 class MonitorResult(BaseModel):
-    """MonitorAgent → Supervisor."""
+    """Monitor agent → Supervisor."""
     events: list[MonitorEvent] = Field(default_factory=list)
-    failed_jobs: list[str] = Field(default_factory=list)
     completed_jobs: list[str] = Field(default_factory=list)
+    failed_jobs: list[str] = Field(default_factory=list)
+    log_content: str = ""                           # actual log file content
     summary: str = ""

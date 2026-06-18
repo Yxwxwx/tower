@@ -77,6 +77,7 @@ class ArtifactRef(BaseModel):
     """Lightweight reference to an artifact — used in AgentTask.artifacts_in."""
     artifact_id: str
     type: str = ""
+    description: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════

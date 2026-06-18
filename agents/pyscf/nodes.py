@@ -247,14 +247,29 @@ def pre_done(state) -> dict:
 
 
 def read_output(state) -> dict:
-    """Read PySCF output log from HPC execution."""
+    """Read log content from monitor's artifact (passed via ArtifactRef.description)."""
     log_id = ""
     log_content = ""
     for ref in state.task.artifacts_in:
-        if ref.type in ("log",):
-            log_id = ref.artifact_id
+        ref_type = getattr(ref, "type", "")
+        if ref_type == "log":
+            log_id = getattr(ref, "artifact_id", "")
+            # Monitor stores actual log content in the description field
+            log_content = getattr(ref, "description", "")
+            if log_content:
+                break
 
-    # In production: resolve log_id via ArtifactResolver → read file
+    # Fallback: try to read log file from disk
+    if not log_content:
+        for ref in state.task.artifacts_in:
+            ref_type = getattr(ref, "type", "")
+            if ref_type == "log":
+                import os
+                desc = getattr(ref, "description", "")
+                if desc and os.path.exists(desc):
+                    log_content = open(desc).read()
+                    break
+
     return {
         "node_history": state.node_history + ["read_output"],
         **_update_scratchpad(state, log_artifact_id=log_id, log_content=log_content),

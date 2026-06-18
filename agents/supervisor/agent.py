@@ -166,7 +166,11 @@ def dispatch_agent(state: SupervisorState) -> dict:
 
     # Build AgentTask with upstream artifacts
     artifacts_in = [
-        ArtifactRef(artifact_id=a["artifact_id"], type=a.get("type", ""))
+        ArtifactRef(
+            artifact_id=a["artifact_id"],
+            type=a.get("type", ""),
+            description=a.get("description", ""),
+        )
         for a in state.pending_artifacts
     ]
 
@@ -391,7 +395,12 @@ def _build_monitor_params(state: SupervisorState) -> dict:
                     watchlist = {v: k for k, v in hpc_data.job_ids.items()}
                     break
 
-    return MonitorParams(watchlist=watchlist, poll_interval_s=5)
+    return MonitorParams(
+        watchlist=watchlist,
+        run_dir=state.run_id,
+        poll_interval_s=10,
+        max_wait_s=86400,
+    )
 
 
 def _last_domain_agent(state: SupervisorState) -> str:
